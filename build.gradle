@@ -275,13 +275,14 @@ tasks.register('myJpackage', Exec) {
         jpackageExec += ".exe"
     }
 
+    def appName = project.cfgAppName
     def argsList = [
             jpackageExec,
-            '--name', displayName,
+            '--name', appName,
             '--app-version', appVersion,
             '--vendor', vendor,
             '--copyright', "Copyright @ ${vendor}",
-            '--description', "一个功能强大的多协议下载管理器，支持 HTTP、HTTPS、FTP、SFTP、BitTorrent 和 M3U8 等多种协议，提供直观的图形界面和丰富的下载管理功能",
+            '--description', "OmniFetch - 万象抓取",
             '--input', libDir.absolutePath,
             '--main-jar', mainJar,
             '--main-class', mainClass,
