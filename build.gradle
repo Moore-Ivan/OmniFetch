@@ -57,6 +57,13 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
+// processResources 阶段用 cfgVersion 填充 version.properties
+processResources {
+    filesMatching('version.properties') {
+        expand(appVersion: cfgVersion)
+    }
+}
+
 tasks.withType(Javadoc) {
     options.encoding = 'UTF-8'
 }

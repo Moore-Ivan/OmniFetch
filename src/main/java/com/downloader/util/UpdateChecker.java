@@ -1,10 +1,14 @@
 package com.downloader.util;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 
 /**
@@ -15,6 +19,33 @@ public final class UpdateChecker {
 
     private static final String REPO_API =
             "https://api.github.com/repos/Moore-Ivan/OmniFetch/releases/latest";
+
+    /** 信任所有证书的 HttpClient（仅用于更新检查，读取公开 API） */
+    private static final HttpClient HTTP_CLIENT;
+
+    static {
+        HttpClient client;
+        try {
+            TrustManager[] trustAll = {
+                new X509TrustManager() {
+                    @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                    @Override public void checkClientTrusted(X509Certificate[] c, String t) { }
+                    @Override public void checkServerTrusted(X509Certificate[] c, String t) { }
+                }
+            };
+            SSLContext sslCtx = SSLContext.getInstance("TLS");
+            sslCtx.init(null, trustAll, new java.security.SecureRandom());
+            client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(10))
+                    .sslContext(sslCtx)
+                    .build();
+        } catch (Exception e) {
+            client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(10))
+                    .build();
+        }
+        HTTP_CLIENT = client;
+    }
 
     private UpdateChecker() {
     }
@@ -53,10 +84,6 @@ public final class UpdateChecker {
      */
     public static Result check(String currentVersion) {
         try {
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(10))
-                    .build();
-
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(REPO_API))
                     .timeout(Duration.ofSeconds(15))
@@ -65,7 +92,7 @@ public final class UpdateChecker {
                     .GET()
                     .build();
 
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) {
                 return Result.error("HTTP " + response.statusCode());
             }

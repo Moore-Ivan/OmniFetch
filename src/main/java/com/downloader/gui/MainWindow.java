@@ -6,6 +6,7 @@ import com.downloader.model.DownloadTask;
 import com.downloader.model.Protocol;
 import com.downloader.util.FileUtils;
 import com.downloader.util.UpdateChecker;
+import com.downloader.util.VersionInfo;
 import com.formdev.flatlaf.FlatDarkLaf;
 import com.formdev.flatlaf.FlatLightLaf;
 
@@ -92,8 +93,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private static final Color BADGE_M3U8    = new Color(160, 80, 200);
     private static final Color BADGE_UNKNOWN = new Color(128, 132, 144);
 
-    /** 应用版本号（与 build.gradle cfgVersion 保持一致） */
-    private static final String APP_VERSION = "1.0.0";
+    /** 应用版本号（由 VersionInfo 从 version.properties 读取，与 build.gradle cfgVersion 一致） */
+    private static final String APP_VERSION = VersionInfo.getDisplayVersion();
 
     // --- UI 组件 ---
     private JTextField urlField;
@@ -185,7 +186,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     private void initUI() {
-        setTitle("万象抓取");
+        setTitle("万象抓取" + VersionInfo.getDisplayVersion());
         setSize(960, 650);
         // 关键：禁用 JFrame 默认关闭行为，由 windowClosing 手动处理，
         // 点击取消时窗口不关闭
@@ -1357,7 +1358,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                         <div class="info-icon"><i class="fas fa-tag"></i></div>
                         <div class="info-body">
                             <div class="info-label">Version</div>
-                            <div class="info-value">v1.0.0</div>
+                            <div class="info-value">${VersionInfo.getDisplayVersion()}</div>
                         </div>
                     </div>
 
@@ -1499,7 +1500,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                 updateBtn.setEnabled(true);
                 if (result.hasUpdate) {
                     int choice = JOptionPane.showOptionDialog(this,
-                            "发现新版本 v" + result.latestVersion + "\n当前版本 v" + APP_VERSION + "\n\n是否前往下载？",
+                            "发现新版本 v" + result.latestVersion + "\n当前版本 " + APP_VERSION + "\n\n是否前往下载？",
                             "发现新版本",
                             JOptionPane.YES_NO_OPTION,
                             JOptionPane.INFORMATION_MESSAGE,
@@ -1519,7 +1520,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                     if (result.errorMsg != null) {
                         Toast.warning(this, "检查更新失败：" + result.errorMsg);
                     } else {
-                        Toast.success(this, "当前已是最新版本 v" + APP_VERSION);
+                        Toast.success(this, "当前已是最新版本 " + APP_VERSION);
                     }
                 }
             });
