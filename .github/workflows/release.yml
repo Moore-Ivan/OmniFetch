@@ -33,10 +33,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build fat jar
-        run: gradle shadowJar --no-daemon -Dfile.encoding=UTF-8
+        run: gradle shadowJar --no-daemon
 
       - name: Build installer (jpackage)
-        run: gradle myJpackage --no-daemon -Dfile.encoding=UTF-8
+        run: gradle myJpackage --no-daemon
 
       - name: Upload installer to Release
         uses: softprops/action-gh-release@v2
