@@ -72,7 +72,6 @@ OmniFetch/
 │   ├── protocol/      # 协议实现
 │   ├── util/          # 工具类
 │   └── Main.java      # 应用入口
-├── config/            # 配置文件
 ├── build.gradle       # Gradle构建配置
 └── README.md          # 项目说明
 ```
@@ -98,7 +97,7 @@ OmniFetch/
    构建完成后，可执行jar文件会生成在 `build/libs/` 目录下。
 3. **运行应用**
    ```bash
-   java -jar build/libs/OmniFetch.jar
+   java -jar build/libs/OmniFetch-x.x.x-all.jar
    ```
 
 ### 直接使用已构建的分发包

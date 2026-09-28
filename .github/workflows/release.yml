@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  JAVA_TOOL_OPTIONS: '-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8'
+  JAVA_TOOL_OPTIONS: '-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8'
   GRADLE_OPTS: '-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8'
 
 jobs:
@@ -19,9 +19,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set UTF-8 code page
-        run: chcp 65001
 
       - name: Setup JDK 21
         uses: actions/setup-java@v4
@@ -33,10 +30,22 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build fat jar
-        run: gradle shadowJar --no-daemon
+        shell: cmd
+        run: |
+          chcp 65001
+          gradle shadowJar --no-daemon
 
       - name: Build installer (jpackage)
-        run: gradle myJpackage --no-daemon
+        shell: cmd
+        run: |
+          chcp 65001
+          gradle myJpackage --no-daemon
+
+      - name: List jpackage output
+        shell: cmd
+        run: |
+          chcp 65001
+          dir build\jpackage
 
       - name: Upload installer to Release
         uses: softprops/action-gh-release@v2
