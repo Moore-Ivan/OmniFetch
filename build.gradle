@@ -1,0 +1,308 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow' version '9.4.2'
+}
+
+// ============================================================
+// 【跨平台判断】使用 JDK 标准 API，避免依赖 Gradle internal 包
+// ============================================================
+ext.isWindowsOs = System.getProperty('os.name').toLowerCase().contains('windows')
+ext.isMacOs     = System.getProperty('os.name').toLowerCase().contains('mac')
+
+// ============================================================
+// 【作用域修复】用 ext. 代替 def，让变量成为 Project 的扩展属性
+// ============================================================
+ext.cfgAppName = 'OmniFetch'
+ext.cfgDisplayName = '万象抓取'
+ext.cfgVersion = '1.0.0'
+ext.cfgMainClass = 'com.downloader.Main'
+ext.cfgVendor = 'Ivan'
+ext.cfgMainJarName = "${cfgAppName}-${cfgVersion}.jar"
+
+// 自定义 JRE 输出目录
+ext.cfgCustomJreDir = layout.buildDirectory.dir("custom-jre").get().asFile
+// installDist 生成的 lib 目录
+ext.cfgLibDir = layout.buildDirectory.dir("install/${cfgAppName}/lib").get().asFile
+
+// ============================================================
+// 【动态 JRE】: 模块列表由 jdeps 自动分析得出
+// ============================================================
+ext.cfgJreExtraModules = [
+        'java.base',
+        'java.desktop',
+        'jdk.unsupported',
+        'jdk.localedata'
+]
+
+project.version = cfgVersion
+project.group = 'com.downloader'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.formdev:flatlaf:3.5'
+    implementation 'com.github.mwiede:jsch:0.2.21'
+    testImplementation 'junit:junit:4.13.2'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(Javadoc) {
+    options.encoding = 'UTF-8'
+}
+
+// ==========================================
+// 1. Application 插件
+// ==========================================
+application {
+    mainClass = cfgMainClass
+}
+
+// ==========================================
+// 2. 标准 Jar (Thin Jar)
+// ==========================================
+jar {
+    archiveBaseName.set(cfgAppName)
+    archiveVersion.set(cfgVersion)
+    archiveClassifier.set('')
+    manifest {
+        attributes(
+                'Main-Class': application.mainClass.get(),
+                'Implementation-Title': cfgDisplayName,
+                'Implementation-Version': cfgVersion
+        )
+    }
+}
+
+// ==========================================
+// 3. Fat Jar (Shadow Jar)
+// ==========================================
+shadowJar {
+    archiveBaseName.set(cfgAppName)
+    archiveVersion.set(cfgVersion)
+    archiveClassifier.set('all')
+    manifest {
+        attributes 'Main-Class': application.mainClass.get()
+    }
+    mergeServiceFiles()
+    append 'META-INF/LICENSE'
+    append 'META-INF/NOTICE'
+}
+
+// ============================================================
+// 4. buildCustomJre
+//    使用 ProcessBuilder 执行 jdeps / java / jlink
+//    (Gradle 9 已移除 Project.exec()，故不再使用 exec {})
+// ============================================================
+tasks.register('buildCustomJre') {
+    group = 'distribution'
+    description = '用 jdeps + jlink 为当前应用生成定制化精简 JRE'
+
+    dependsOn 'installDist'
+
+    def libDir = project.cfgLibDir
+    def jreDir = project.cfgCustomJreDir
+    def extraModules = project.cfgJreExtraModules
+    def isWindows = project.isWindowsOs
+
+    inputs.dir(libDir)
+    inputs.property('extraModules', extraModules.join(','))
+    inputs.property('javaVersion', JavaVersion.current().majorVersion)
+    outputs.dir(jreDir)
+
+    doLast {
+        delete jreDir
+        jreDir.parentFile.mkdirs()
+
+        def javaHome = System.getProperty('java.home')
+        def exeSuffix = isWindows ? ".exe" : ""
+        def jdepsExec = "${javaHome}/bin/jdeps${exeSuffix}"
+        def jlinkExec = "${javaHome}/bin/jlink${exeSuffix}"
+        def javaExec  = "${javaHome}/bin/java${exeSuffix}"
+
+        // ---------- 通用进程执行器 ----------
+        // 接收任意集合/数组, 内部手工构造 String[], 不依赖 Groovy 的类型强转
+        def runProcess = { cmdArg ->
+            def cmdList
+            if (cmdArg instanceof List) {
+                cmdList = (List) cmdArg
+            } else if (cmdArg instanceof Object[]) {
+                cmdList = Arrays.asList((Object[]) cmdArg)
+            } else {
+                cmdList = [cmdArg]
+            }
+
+            String[] cmdArray = new String[cmdList.size()]
+            for (int i = 0; i < cmdList.size(); i++) {
+                Object e = cmdList.get(i)
+                cmdArray[i] = (e == null) ? "" : e.toString()
+            }
+
+            def pb = new ProcessBuilder(cmdArray)
+            def proc = pb.start()
+
+            def outBuf = new StringBuilder()
+            def errBuf = new StringBuilder()
+            def tOut = Thread.start {
+                proc.inputStream.withReader('UTF-8') { r -> outBuf.append(r.text) }
+            }
+            def tErr = Thread.start {
+                proc.errorStream.withReader('UTF-8') { r -> errBuf.append(r.text) }
+            }
+            int exit = proc.waitFor()
+            tOut.join()
+            tErr.join()
+            return [out: outBuf.toString(), err: errBuf.toString(), code: exit]
+        }
+
+        // ---------- 收集所有 jar (显式循环, 不用 collect) ----------
+        def jarFiles = new ArrayList()
+        fileTree(libDir) { include '*.jar' }.files.each { f ->
+            jarFiles.add(f.absolutePath.toString())
+        }
+        if (jarFiles.isEmpty()) {
+            throw new RuntimeException("未在 ${libDir} 找到任何 jar，installDist 可能未成功执行")
+        }
+        println "==> 待分析 jar 数量: ${jarFiles.size()}"
+
+        // ---------- 1) jdeps ----------
+        // 【关键】每个元素都用 add(), 不用 addAll(), 不用 + 拼接
+        def classPath = jarFiles.join(File.pathSeparator)
+        def jdepsCmd = new ArrayList()
+        jdepsCmd.add(jdepsExec)
+        jdepsCmd.add('--multi-release')
+        jdepsCmd.add(JavaVersion.current().majorVersion.toString())
+        jdepsCmd.add('--ignore-missing-deps')
+        jdepsCmd.add('--print-module-deps')
+        jdepsCmd.add('--class-path')
+        jdepsCmd.add(classPath)
+        jarFiles.each { jdepsCmd.add(it) }
+
+        def jdepsRes = runProcess(jdepsCmd)
+        def rawModules = jdepsRes.out.trim()
+        if (jdepsRes.code != 0) {
+            println "==> jdeps 退出码: ${jdepsRes.code}"
+            println "==> jdeps stderr:\n${jdepsRes.err.trim()}"
+        }
+        if (!rawModules) {
+            throw new RuntimeException("jdeps 未能分析出任何模块, 请检查上面的日志")
+        }
+        println "==> jdeps 分析结果: ${rawModules}"
+
+        // ---------- 2) 合并 + 去重 ----------
+        def moduleSet = new LinkedHashSet()
+        rawModules.split(',').each { m ->
+            def s = m.trim()
+            if (s) moduleSet.add(s)
+        }
+        extraModules.each { moduleSet.add(it) }
+
+        // 查询当前 JDK 实际存在的模块
+        def listCmd = new ArrayList()
+        listCmd.add(javaExec)
+        listCmd.add('--list-modules')
+        def listRes = runProcess(listCmd)
+
+        def availableModules = [] as Set
+        listRes.out.readLines().each { line ->
+            def idx = line.indexOf('@')
+            if (idx > 0) availableModules.add(line.substring(0, idx).trim())
+        }
+
+        def finalModules = moduleSet.findAll { availableModules.contains(it) }
+        def dropped = moduleSet - finalModules.toSet()
+        if (dropped) {
+            println "==> 忽略当前 JDK 不存在的模块: ${dropped.join(', ')}"
+        }
+        if (finalModules.isEmpty()) {
+            throw new RuntimeException("合并后的模块列表为空，无法 jlink")
+        }
+
+        def modulesArg = finalModules.join(',')
+        println "==> jlink 最终使用模块: ${modulesArg}"
+
+        // ---------- 3) jlink ----------
+        def jlinkCmd = new ArrayList()
+        jlinkCmd.add(jlinkExec)
+        jlinkCmd.add('--add-modules')
+        jlinkCmd.add(modulesArg)
+        jlinkCmd.add('--strip-debug')
+        jlinkCmd.add('--no-header-files')
+        jlinkCmd.add('--no-man-pages')
+        jlinkCmd.add('--compress')
+        jlinkCmd.add('zip-6')
+        jlinkCmd.add('--output')
+        jlinkCmd.add(jreDir.absolutePath)
+
+        def jlinkRes = runProcess(jlinkCmd)
+        if (jlinkRes.code != 0) {
+            throw new RuntimeException("jlink 失败 (exit=${jlinkRes.code}):\n${jlinkRes.err.trim()}")
+        }
+
+        println "==> 自定义 JRE 生成完成: ${jreDir}"
+    }
+}
+
+// ==========================================
+// 5. jpackage 打包
+// ==========================================
+tasks.register('myJpackage', Exec) {
+    dependsOn 'installDist'
+    dependsOn 'buildCustomJre'
+
+    def appVersion = project.version.toString()
+    def libDir = project.cfgLibDir
+    def jreDir = project.cfgCustomJreDir
+    def vendor = project.cfgVendor
+    def displayName = project.cfgDisplayName
+    def mainJar = project.cfgMainJarName
+    def mainClass = project.cfgMainClass
+    def isWindows = project.isWindowsOs
+    def isMac = project.isMacOs
+
+    def jpackageExec = "${System.getProperty('java.home')}/bin/jpackage"
+    if (isWindows) {
+        jpackageExec += ".exe"
+    }
+
+    def argsList = [
+            jpackageExec,
+            '--name', displayName,
+            '--app-version', appVersion,
+            '--vendor', vendor,
+            '--copyright', "Copyright @ ${vendor}",
+            '--description', "一个功能强大的多协议下载管理器，支持 HTTP、HTTPS、FTP、SFTP、BitTorrent 和 M3U8 等多种协议，提供直观的图形界面和丰富的下载管理功能",
+            '--input', libDir.absolutePath,
+            '--main-jar', mainJar,
+            '--main-class', mainClass,
+            '--dest', layout.buildDirectory.dir("jpackage").get().asFile.absolutePath,
+            '--runtime-image', jreDir.absolutePath
+    ]
+
+    if (isWindows) {
+        argsList.addAll([
+                '--type', 'exe',
+                '--icon', "${projectDir}/src/main/resources/${displayName}.ico",
+                '--win-shortcut',
+                '--win-shortcut-prompt',
+                '--win-dir-chooser',
+                '--win-menu'
+        ])
+    } else if (isMac) {
+        argsList.addAll([
+                '--type', 'dmg'
+        ])
+    }
+
+    commandLine argsList
+}

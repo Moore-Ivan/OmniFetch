@@ -1,0 +1,50 @@
+pluginManagement {
+    repositories {
+        // 1. 本地 Maven 仓库（如果本地有安装的插件，优先使用；担心旧缓存可移到后面或删除）
+        mavenLocal()
+
+        // 2. 国内镜像源（按顺序尝试，找到即停）
+        // 阿里云 Gradle 插件仓库
+        maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+        // 阿里云公共仓库（聚合了 central、jcenter、google 等）
+        maven { url = uri('https://maven.aliyun.com/repository/public') }
+        // 腾讯云 Maven 公共仓库
+        maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+        // 华为云 Maven 仓库
+        maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+
+        // 3. 官方兜底源
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    // PREFER_SETTINGS：优先使用本文件中定义的仓库；子项目若自己定义了仓库，则子项目优先。
+    // 如果想强制统一所有子项目仓库，可改为 RepositoriesMode.FAIL_ON_PROJECT_REPOS。
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+
+    repositories {
+        // 1. 本地 Maven 仓库
+        mavenLocal()
+
+        // 2. 国内镜像源（按顺序尝试，找到即停）
+        // 阿里云公共仓库（推荐，聚合度高）
+        maven { url = uri('https://maven.aliyun.com/repository/public') }
+        // 阿里云 Google 仓库（Android 项目常用，public 已包含，可按需保留）
+        maven { url = uri('https://maven.aliyun.com/repository/google') }
+        // 阿里云中央仓库（public 已包含，可按需保留）
+        maven { url = uri('https://maven.aliyun.com/repository/central') }
+        // 腾讯云 Maven 公共仓库
+        maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+        // 华为云 Maven 仓库
+        maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+
+        // 3. 官方兜底源
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'OmniFetch'

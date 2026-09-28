@@ -1,0 +1,60 @@
+# ===== Gradle =====
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ===== 自定义 JRE (本地打包用，体积大，不入库) =====
+custom-jre/
+
+# ===== IDE =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.trae/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Eclipse =====
+.classpath
+.project
+.settings/
+bin/
+
+# ===== NetBeans =====
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 打包产物 (本地构建的安装包不入库，由 GitHub Actions 发布) =====
+*.exe
+*.msi
+*.dmg
+*.pkg
+*.deb
+*.rpm
+# 但保留项目图标等源资源中的 .ico
+!src/main/resources/*.ico
+
+# ===== 日志与临时文件 =====
+*.log
+logs/
+tmp/
+temp/
+
+# ===== 运行时生成的配置目录 (程序运行后产生) =====
+config/
+
+# ===== 文档类文件 (日常产生) =====
+GitHub.md
+
+# ===== Bug检查 =====
+bugcheck/
