@@ -381,8 +381,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         // 初始化任务列表
         refreshTasks();
 
-        // 启动时自动检查更新（静默，仅在有新版本时提示）
-        checkForUpdate(false);
+        // 启动后延迟自动检查更新（等窗口完全显示后）
+        Timer autoCheckTimer = new Timer(2000, e -> checkForUpdate(false));
+        autoCheckTimer.setRepeats(false);
+        autoCheckTimer.start();
     }
 
     // ══════════════════════════════════════════
@@ -761,7 +763,11 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     //  退出逻辑
     // ══════════════════════════════════════════
 
+    private volatile boolean exiting = false;
+
     private void handleExit() {
+        if (exiting) return;
+        exiting = true;
         int result = JOptionPane.showConfirmDialog(this,
                 "确定要退出？\n未完成的下载任务将被取消。",
                 "确认退出",
@@ -771,6 +777,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             downloadManager.shutdown();
             dispose();
             System.exit(0);
+        } else {
+            exiting = false;
         }
     }
 
@@ -1358,7 +1366,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                         <div class="info-icon"><i class="fas fa-tag"></i></div>
                         <div class="info-body">
                             <div class="info-label">Version</div>
-                            <div class="info-value">${VersionInfo.getDisplayVersion()}</div>
+                            <div class="info-value">$VERSION</div>
                         </div>
                     </div>
 
@@ -1473,7 +1481,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 """;
         try {
             Path temp = Files.createTempFile("contact-author-", ".html");
-            Files.writeString(temp, html);
+            Files.writeString(temp, html.replace("$VERSION", VersionInfo.getDisplayVersion()));
             temp.toFile().deleteOnExit();
             if (Desktop.isDesktopSupported()) {
                 Desktop.getDesktop().browse(temp.toUri());
@@ -1492,11 +1500,22 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     /**
      * @param manual true = 手动点击（显示"已是最新"或错误提示）；false = 启动自动检查（仅新版本提示）
      */
+    private volatile boolean updateChecking = false;
+
     private void checkForUpdate(boolean manual) {
-        updateBtn.setEnabled(false);
+        if (updateChecking) {
+            if (manual) Toast.info(this, "正在检查中…");
+            return;
+        }
+        updateChecking = true;
+        if (manual) {
+            updateBtn.setEnabled(false);
+            Toast.info(this, "正在检查更新…");
+        }
         Thread.ofVirtual().start(() -> {
             UpdateChecker.Result result = UpdateChecker.check(APP_VERSION);
             EventQueue.invokeLater(() -> {
+                updateChecking = false;
                 updateBtn.setEnabled(true);
                 if (result.hasUpdate) {
                     int choice = JOptionPane.showOptionDialog(this,
