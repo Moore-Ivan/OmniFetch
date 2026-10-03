@@ -109,7 +109,7 @@ OmniFetch/
    - 下载Windows可执行文件（.exe格式）
 
 2. **运行程序**
-   - Windows: 双击 `OmniFetch.exe` 即可运行
+   - Windows: 双击 `OmniFetch-x.x.x.exe` 即可运行
 
 3. **注意事项**
    - 软件安装包已包含所有依赖，无需额外配置Java环境
