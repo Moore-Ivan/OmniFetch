@@ -80,10 +80,10 @@ OmniFetch/
 
 ### 环境要求
 
-- Java 17 或更高版本
-- 操作系统：Windows、macOS、Linux
+- **源码安装需要**：Java 17 或更高版本
+- **软件安装支持**：Windows操作系统
 
-### 从源码构建
+### 源码安装（需要Java环境）
 
 1. **克隆项目**
    ```bash
@@ -100,11 +100,21 @@ OmniFetch/
    java -jar build/libs/OmniFetch-x.x.x-all.jar
    ```
 
-### 直接使用已构建的分发包
+### 软件安装（推荐，目前仅支持Windows）
 
-1. 从 `build/distributions/` 目录获取分发包（.zip 或 .tar）
-2. 解压到任意目录
-3. 运行 `bin/OmniFetch`（Linux/macOS）或 `bin/OmniFetch.bat`（Windows）
+对于普通用户，可以直接下载已编译好的Windows可执行文件：
+
+1. **访问Release页面**
+   - 访问项目GitHub Release页面：[https://github.com/Moore-Ivan/OmniFetch/releases](https://github.com/Moore-Ivan/OmniFetch/releases)
+   - 下载Windows可执行文件（.exe格式）
+
+2. **运行程序**
+   - Windows: 双击 `OmniFetch.exe` 即可运行
+
+3. **注意事项**
+   - 软件安装包已包含所有依赖，无需额外配置Java环境
+   - 支持一键安装，适合不熟悉Java环境的用户
+   - 提供自动更新功能（如可用）
 
 ## 使用指南
 
