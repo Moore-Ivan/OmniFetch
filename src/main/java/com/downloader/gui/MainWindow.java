@@ -785,10 +785,14 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     private void showExitConfirm() {
+        String message = "确定要退出？\n未完成的下载任务将被取消。";
+        if (activeUpdateDialog != null && activeUpdateDialog.isDownloadActive()) {
+            message += "\n更新包正在后台下载，退出将中断（已下载部分保留，下次可断点续传）。";
+        }
         int result;
         try {
             result = JOptionPane.showConfirmDialog(this,
-                    "确定要退出？\n未完成的下载任务将被取消。",
+                    message,
                     "确认退出",
                     JOptionPane.OK_CANCEL_OPTION);
         } catch (RuntimeException e) {
@@ -1526,7 +1530,17 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
      */
     private volatile boolean updateChecking = false;
 
+    /** 当前更新会话（含后台下载中的对话框），null 表示无会话 */
+    private UpdateDialog activeUpdateDialog;
+    /** 后台下载期间更新「检查更新」按钮文案的节流定时器 */
+    private Timer updateBgTimer;
+
     private void checkForUpdate(boolean manual) {
+        // 已有更新会话（前台或后台下载中）：直接恢复窗口，不重复检查
+        if (activeUpdateDialog != null) {
+            activeUpdateDialog.bringToFront();
+            return;
+        }
         if (updateChecking) {
             if (manual) Toast.info(this, "正在检查中…");
             return;
@@ -1542,7 +1556,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                 updateChecking = false;
                 updateBtn.setEnabled(true);
                 if (result.hasUpdate) {
-                    new UpdateDialog(this, result, APP_VERSION).setVisible(true);
+                    activeUpdateDialog = new UpdateDialog(this, result, APP_VERSION);
+                    activeUpdateDialog.setVisible(true);
                 } else if (manual) {
                     if (result.errorMsg != null) {
                         Toast.warning(this, "检查更新失败：" + result.errorMsg);
@@ -1552,6 +1567,61 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                 }
             });
         });
+    }
+
+    // ── 更新对话框后台会话回调（EDT） ──
+
+    void onUpdateDialogBackgrounded(UpdateDialog dialog) {
+        if (dialog != activeUpdateDialog) {
+            return;
+        }
+        if (updateBgTimer == null) {
+            updateBgTimer = new Timer(500, e -> refreshUpdateBgButton());
+        }
+        updateBgTimer.start();
+        refreshUpdateBgButton();
+    }
+
+    void onUpdateDialogForeground(UpdateDialog dialog) {
+        if (dialog != activeUpdateDialog) {
+            return;
+        }
+        if (updateBgTimer != null) {
+            updateBgTimer.stop();
+        }
+        updateBtn.setText("检查更新");
+        updateBtn.setToolTipText(null);
+    }
+
+    void onUpdateDialogClosed(UpdateDialog dialog) {
+        if (dialog != activeUpdateDialog) {
+            return;
+        }
+        activeUpdateDialog = null;
+        if (updateBgTimer != null) {
+            updateBgTimer.stop();
+        }
+        updateBtn.setText("检查更新");
+        updateBtn.setToolTipText(null);
+    }
+
+    /** 后台下载时把「检查更新」按钮变成实时状态入口 */
+    private void refreshUpdateBgButton() {
+        UpdateDialog dialog = activeUpdateDialog;
+        if (dialog == null || !dialog.isBackground()) {
+            return;
+        }
+        if (dialog.isError()) {
+            updateBtn.setText("更新失败，点击查看");
+        } else if (dialog.isPaused()) {
+            updateBtn.setText("更新已暂停");
+        } else if (dialog.isDownloading()) {
+            int percent = dialog.getPercent();
+            updateBtn.setText(percent >= 0 ? "更新中 " + percent + "%" : "更新中…");
+        } else {
+            updateBtn.setText("检查更新");
+        }
+        updateBtn.setToolTipText("点击查看更新下载进度");
     }
 
     // ══════════════════════════════════════════

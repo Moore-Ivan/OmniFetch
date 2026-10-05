@@ -15,7 +15,7 @@ ext.isMacOs     = System.getProperty('os.name').toLowerCase().contains('mac')
 // ============================================================
 ext.cfgAppName = 'OmniFetch'
 ext.cfgDisplayName = '万象抓取'
-ext.cfgVersion = '1.1.0'
+ext.cfgVersion = '1.1.1'
 ext.cfgMainClass = 'com.downloader.Main'
 ext.cfgVendor = 'Ivan'
 ext.cfgMainJarName = "${cfgAppName}-${cfgVersion}.jar"
@@ -58,7 +58,10 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 // processResources 阶段用 cfgVersion 填充 version.properties
+// 必须把 appVersion 声明为任务输入：否则修改 cfgVersion 时任务不会失效，
+// build/resources/main/version.properties 会残留旧版本号，导致运行时版本与 cfgVersion 不一致
 processResources {
+    inputs.property('appVersion', cfgVersion)
     filesMatching('version.properties') {
         expand(appVersion: cfgVersion)
     }

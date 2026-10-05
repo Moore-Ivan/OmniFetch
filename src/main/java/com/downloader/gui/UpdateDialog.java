@@ -21,11 +21,14 @@ import java.util.Locale;
  * 状态机：READY → DOWNLOADING ⇄ PAUSED → COMPLETED；
  * 任意下载阶段可取消（回到 READY），出错进入 ERROR 可重试。
  * 支持应用内下载安装包（断点续传、实时速度与进度），并可随时"查看发布页"。
+ * 非模态对话框，下载过程中可「后台下载」隐藏窗口继续使用主程序：
+ * 下载线程独立运行，完成后自动启动安装程序。
  */
 final class UpdateDialog extends JDialog {
 
     private enum State { READY, DOWNLOADING, PAUSED, COMPLETED, ERROR }
 
+    private final MainWindow owner;
     private final Result result;
     private final Asset asset;
     private final File installerFile;
@@ -33,6 +36,11 @@ final class UpdateDialog extends JDialog {
     private UpdateDownloader downloader;
     private State state = State.READY;
     private String errorMessage;
+
+    /** 是否处于后台模式（窗口隐藏，下载继续） */
+    private boolean background;
+    /** 最近一次进度百分比，-1 表示未知（供主窗口后台指示读取） */
+    private volatile int lastPercent = -1;
 
     private JProgressBar progressBar;
     private JLabel percentLabel;
@@ -42,8 +50,10 @@ final class UpdateDialog extends JDialog {
     private JPanel buttonBar;
     private JButton primaryButton;
 
-    UpdateDialog(Window owner, Result result, String currentVersionDisplay) {
-        super(owner, "检查更新", ModalityType.APPLICATION_MODAL);
+    UpdateDialog(MainWindow owner, Result result, String currentVersionDisplay) {
+        // 非模态：更新窗口打开期间主窗口仍可正常使用
+        super(owner, "检查更新", ModalityType.MODELESS);
+        this.owner = owner;
         this.result = result;
         this.asset = pickWindowsAsset(result);
         File dir = UpdateDownloader.defaultDownloadDir();
@@ -215,12 +225,20 @@ final class UpdateDialog extends JDialog {
             case DOWNLOADING -> {
                 status("正在下载更新包…", null);
                 addSecondaryButton("取消下载", e -> cancelDownload());
+                JButton bgBtn = flatButton("后台下载", UiIcons.background());
+                bgBtn.addActionListener(e -> hideToBackground());
+                bgBtn.setToolTipText("隐藏窗口并在后台继续下载，完成后自动安装，不影响当前使用");
+                buttonBar.add(bgBtn);
                 primaryButton = primaryButton("暂停", UiIcons.pause(), e -> pauseDownload());
                 buttonBar.add(primaryButton);
             }
             case PAUSED -> {
-                status("已暂停，可继续或取消下载。", MainWindow.WARNING);
+                status("已暂停，可继续、转后台或取消下载。", MainWindow.WARNING);
                 addSecondaryButton("取消下载", e -> cancelDownload());
+                JButton bgBtn = flatButton("后台下载", UiIcons.background());
+                bgBtn.addActionListener(e -> hideToBackground());
+                bgBtn.setToolTipText("隐藏窗口保留下载进度，可随时从主窗口「检查更新」入口恢复");
+                buttonBar.add(bgBtn);
                 primaryButton = primaryButton("继续", UiIcons.resume(), e -> resumeDownload());
                 buttonBar.add(primaryButton);
                 speedLabel.setText("已暂停");
@@ -294,6 +312,7 @@ final class UpdateDialog extends JDialog {
             @Override
             public void onStart(long totalBytes) {
                 EventQueue.invokeLater(() -> {
+                    lastPercent = totalBytes > 0 ? 0 : -1;
                     if (totalBytes <= 0) {
                         progressBar.setIndeterminate(true);
                         percentLabel.setText("--");
@@ -326,6 +345,10 @@ final class UpdateDialog extends JDialog {
                 EventQueue.invokeLater(() -> {
                     updateProgress(file.length(), asset.size > 0 ? asset.size : file.length(), 0, true);
                     setState(State.COMPLETED);
+                    // 后台模式下下载完成：自动启动安装程序，不打断用户操作
+                    if (background) {
+                        autoInstallInBackground();
+                    }
                 });
             }
 
@@ -334,12 +357,18 @@ final class UpdateDialog extends JDialog {
                 EventQueue.invokeLater(() -> {
                     errorMessage = message;
                     setState(State.ERROR);
+                    if (background) {
+                        // 后台下载失败：Toast 提醒，会话保留，点击主窗口按钮可回窗口重试
+                        Toast.warning(owner, "更新包后台下载失败：" + message
+                                + "，点击「检查更新」查看并重试");
+                    }
                 });
             }
 
             @Override
             public void onCancelled() {
                 EventQueue.invokeLater(() -> {
+                    lastPercent = -1;
                     progressBar.setValue(0);
                     percentLabel.setText("0%");
                     sizeLabel.setText(asset.size > 0 ? "0 B / " + FileUtils.formatSize(asset.size) : "0 B");
@@ -357,6 +386,7 @@ final class UpdateDialog extends JDialog {
             progressBar.setIndeterminate(false);
             int percent = forceComplete ? 100 : (int) Math.min(100, downloaded * 100 / totalBytes);
             progressBar.setValue(percent);
+            lastPercent = percent;
             percentLabel.setText(percent + "%");
             sizeLabel.setText(FileUtils.formatSize(downloaded) + " / " + FileUtils.formatSize(totalBytes));
         } else {
@@ -431,13 +461,109 @@ final class UpdateDialog extends JDialog {
         }
     }
 
-    /** 关闭确认：下载进行中/暂停时先取消下载再关闭。 */
+    // ══════ 后台模式 ══════
+
+    /** 隐藏窗口转后台：下载线程独立运行，不影响主程序使用，完成后自动安装。 */
+    private void hideToBackground() {
+        if (state != State.DOWNLOADING && state != State.PAUSED) {
+            dispose();
+            return;
+        }
+        background = true;
+        setVisible(false);
+        owner.onUpdateDialogBackgrounded(this);
+    }
+
+    /** 从后台恢复显示（由主窗口「检查更新」入口调用）。 */
+    void bringToFront() {
+        if (!isDisplayable()) {
+            return;
+        }
+        background = false;
+        // 对话框随属主窗口最小化；恢复属主后再显示，避免挂后台时弹出不可点击的幽灵窗口
+        if (owner.getExtendedState() == JFrame.ICONIFIED) {
+            owner.setExtendedState(JFrame.NORMAL);
+        }
+        owner.setVisible(true);
+        owner.toFront();
+        setVisible(true);
+        toFront();
+        requestFocus();
+        owner.onUpdateDialogForeground(this);
+    }
+
+    /** 后台下载完成后自动启动安装程序；启动失败则恢复窗口交由用户手动安装。 */
+    private void autoInstallInBackground() {
+        if (installerFile == null || !installerFile.exists()) {
+            return;
+        }
+        boolean launched = false;
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(installerFile);
+                launched = true;
+            }
+        } catch (Exception ignored) {
+            launched = false;
+        }
+        if (launched) {
+            Toast.success(owner, "更新安装包已下载完成，安装程序已启动，请按向导完成更新");
+            dispose();
+        } else {
+            Toast.warning(owner, "无法自动启动安装程序，请在更新窗口中手动安装");
+            bringToFront();
+        }
+    }
+
+    // ══════ 供主窗口读取的后台状态 ══════
+
+    boolean isBackground() {
+        return background;
+    }
+
+    boolean isDownloadActive() {
+        return state == State.DOWNLOADING || state == State.PAUSED;
+    }
+
+    boolean isDownloading() {
+        return state == State.DOWNLOADING;
+    }
+
+    boolean isPaused() {
+        return state == State.PAUSED;
+    }
+
+    boolean isError() {
+        return state == State.ERROR;
+    }
+
+    int getPercent() {
+        return lastPercent;
+    }
+
+    @Override
+    public void dispose() {
+        super.dispose();
+        owner.onUpdateDialogClosed(this);
+    }
+
+    /**
+     * 关闭选择：下载进行中/暂停时提供三种处置方式——
+     * 后台继续下载（推荐）、取消下载并关闭、留在当前窗口。
+     */
     private void requestClose() {
         if (state == State.DOWNLOADING || state == State.PAUSED) {
-            int choice = JOptionPane.showConfirmDialog(this,
-                    "更新包尚未下载完成，关闭后将取消本次下载。确定关闭吗？",
-                    "取消下载", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
-            if (choice != JOptionPane.OK_OPTION) {
+            Object[] options = {"后台下载", "取消下载并关闭", "继续等待"};
+            int choice = JOptionPane.showOptionDialog(this,
+                    "更新包尚未下载完成。\n可以最小化到后台继续下载，不影响正常使用，下载完成后将自动安装。",
+                    "更新下载中",
+                    JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE,
+                    null, options, options[0]);
+            if (choice == 0) {
+                hideToBackground();
+                return;
+            }
+            if (choice != 1) {
                 return;
             }
             if (downloader != null) {

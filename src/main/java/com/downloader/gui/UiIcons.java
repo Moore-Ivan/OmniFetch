@@ -275,6 +275,16 @@ public final class UiIcons {
         });
     }
 
+    /** 后台下载（向下箭头收入底部托盘） */
+    public static Icon background() {
+        return icon(16, g -> {
+            line(g, 8, 2.8, 8, 8.4);
+            line(g, 5.8, 6.4, 8, 8.6);
+            line(g, 10.2, 6.4, 8, 8.6);
+            line(g, 3.4, 12.4, 12.6, 12.4);
+        });
+    }
+
     /** 检查更新（圆形箭头） */
     public static Icon update() {
         return icon(16, g -> {
