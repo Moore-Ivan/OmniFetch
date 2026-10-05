@@ -1,6 +1,7 @@
 package com.downloader.gui;
 
 import com.downloader.util.FileUtils;
+import com.downloader.util.UpdateChecker;
 import com.downloader.util.UpdateChecker.Result;
 import com.downloader.util.UpdateChecker.Asset;
 import com.downloader.util.UpdateDownloader;
@@ -179,7 +180,7 @@ final class UpdateDialog extends JDialog {
             setState(State.READY);
         }
 
-        setSize(620, 460);
+        setSize(620, 380);
         setMinimumSize(new Dimension(480, 380));
         setLocationRelativeTo(getOwner());
     }
@@ -390,17 +391,19 @@ final class UpdateDialog extends JDialog {
     // ══════ 发布页 / 安装 / 关闭 ══════
 
     private void openReleasePage() {
+        // 统一打开 Releases 列表页（不进入具体 tag）
+        String pageUrl = UpdateChecker.RELEASES_PAGE_URL;
         try {
             if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                Desktop.getDesktop().browse(URI.create(result.releaseUrl));
+                Desktop.getDesktop().browse(URI.create(pageUrl));
             } else {
                 JOptionPane.showMessageDialog(this,
-                        "当前环境不支持打开浏览器，请手动访问：\n" + result.releaseUrl,
+                        "当前环境不支持打开浏览器，请手动访问：\n" + pageUrl,
                         "无法打开浏览器", JOptionPane.INFORMATION_MESSAGE);
             }
         } catch (Exception e) {
             JOptionPane.showMessageDialog(this,
-                    "无法打开发布页，请手动访问：\n" + result.releaseUrl,
+                    "无法打开发布页，请手动访问：\n" + pageUrl,
                     "打开失败", JOptionPane.WARNING_MESSAGE);
         }
     }

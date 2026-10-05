@@ -19,11 +19,11 @@ public final class UpdateChecker {
 
     private static final String REPO_API =
             "https://api.github.com/repos/Moore-Ivan/OmniFetch/releases/latest";
+    /** Releases 列表页（"查看发布页"统一打开此页，不进入具体 tag） */
+    public static final String RELEASES_PAGE_URL =
+            "https://github.com/Moore-Ivan/OmniFetch/releases";
     /** 网页端 latest：302 跳转到最新 tag 页面，不受 GitHub API 每 IP 限流（403/429）影响 */
-    private static final String REPO_LATEST_PAGE =
-            "https://github.com/Moore-Ivan/OmniFetch/releases/latest";
-    private static final String RELEASE_PAGE_PREFIX =
-            "https://github.com/Moore-Ivan/OmniFetch/releases/tag/";
+    private static final String REPO_LATEST_PAGE = RELEASES_PAGE_URL + "/latest";
 
     /** HttpClient：信任所有证书（与下载器共用 HttpTrust），解决运行环境 cacerts 不完整问题 */
     private static final HttpClient HTTP_CLIENT;
@@ -58,31 +58,29 @@ public final class UpdateChecker {
     public static final class Result {
         public final boolean hasUpdate;
         public final String latestVersion;   // 不带 v 前缀，如 "1.0.1"
-        public final String releaseUrl;      // GitHub Release 页面 URL
         public final String errorMsg;        // 出错时有值
         public final List<Asset> assets;     // 发布资产列表
         public final String releaseNotes;    // 发布说明（Markdown 原文，可为空）
 
-        private Result(boolean hasUpdate, String latestVersion, String releaseUrl, String errorMsg,
+        private Result(boolean hasUpdate, String latestVersion, String errorMsg,
                        List<Asset> assets, String releaseNotes) {
             this.hasUpdate = hasUpdate;
             this.latestVersion = latestVersion;
-            this.releaseUrl = releaseUrl;
             this.errorMsg = errorMsg;
             this.assets = assets != null ? assets : List.of();
             this.releaseNotes = releaseNotes;
         }
 
         static Result noUpdate(String current) {
-            return new Result(false, current, null, null, null, null);
+            return new Result(false, current, null, null, null);
         }
 
-        static Result hasUpdate(String latest, String url, List<Asset> assets, String notes) {
-            return new Result(true, latest, url, null, assets, notes);
+        static Result hasUpdate(String latest, List<Asset> assets, String notes) {
+            return new Result(true, latest, null, assets, notes);
         }
 
         static Result error(String msg) {
-            return new Result(false, null, null, msg, null, null);
+            return new Result(false, null, msg, null, null);
         }
     }
 
@@ -138,10 +136,9 @@ public final class UpdateChecker {
 
         // 简单解析 JSON（不引入第三方依赖）
         String tag = extractText(body, "tag_name");
-        String htmlUrl = extractText(body, "html_url");
         String notes = extractText(body, "body");
 
-        if (tag == null || htmlUrl == null) {
+        if (tag == null) {
             return Result.error("无法解析版本信息");
         }
 
@@ -149,7 +146,7 @@ public final class UpdateChecker {
         String latest = tag.startsWith("v") ? tag.substring(1) : tag;
 
         if (isNewerVersion(currentVersion, latest)) {
-            return Result.hasUpdate(latest, htmlUrl, extractAssets(body), notes);
+            return Result.hasUpdate(latest, extractAssets(body), notes);
         } else {
             return Result.noUpdate(latest);
         }
@@ -190,7 +187,6 @@ public final class UpdateChecker {
             return Result.noUpdate(latest);
         }
 
-        String releaseUrl = RELEASE_PAGE_PREFIX + tag;
         // 资产列表在版本页中通过 expanded_assets 片段异步加载，需再取一次该片段；
         // 片段缺失或抓取失败时退化为直接解析版本页 HTML
         List<Asset> assets = List.of();
@@ -207,7 +203,7 @@ public final class UpdateChecker {
             assets = extractAssetsFromHtml(response.body());
         }
         // 降级链路无发布说明与资产大小（下载开始后由 Content-Length 得知总大小）
-        return Result.hasUpdate(latest, releaseUrl, assets, null);
+        return Result.hasUpdate(latest, assets, null);
     }
 
     private static String fetchPage(String url) throws IOException, InterruptedException {
