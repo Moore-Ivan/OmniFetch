@@ -1,6 +1,8 @@
 package com.downloader;
 
 import com.downloader.gui.MainWindow;
+import com.downloader.util.AppPrefs;
+import com.formdev.flatlaf.FlatDarkLaf;
 import com.formdev.flatlaf.FlatLaf;
 import com.formdev.flatlaf.FlatLightLaf;
 
@@ -19,9 +21,14 @@ public class Main {
             FlatLaf.setGlobalExtraDefaults(Map.of("defaultFont", "13 \"Microsoft YaHei UI\""));
         }
 
-        // 启用 FlatLaf 亮色主题（必须在创建任何 Swing 组件之前设置；
-        // 其余全局样式见 classpath 根目录 FlatLaf.properties，FlatLaf 自动加载）
-        FlatLightLaf.setup();
+        // 启用 FlatLaf 主题（必须在创建任何 Swing 组件之前设置；
+        // 其余全局样式见 classpath 根目录 FlatLaf.properties，FlatLaf 自动加载）；
+        // 主题选择由用户持久化偏好决定，重启后保持上次使用的深浅色
+        if (AppPrefs.isDarkMode()) {
+            FlatDarkLaf.setup();
+        } else {
+            FlatLightLaf.setup();
+        }
 
         // 在事件 dispatch 线程中创建并显示 UI
         SwingUtilities.invokeLater(() -> {

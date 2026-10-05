@@ -4,6 +4,7 @@ import com.downloader.detector.ProtocolDetector;
 import com.downloader.manager.DownloadManager;
 import com.downloader.model.DownloadTask;
 import com.downloader.model.Protocol;
+import com.downloader.util.AppPrefs;
 import com.downloader.util.FileUtils;
 import com.downloader.util.UpdateChecker;
 import com.downloader.util.VersionInfo;
@@ -127,7 +128,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     // --- 状态 ---
     private final DownloadManager downloadManager;
-    private boolean darkMode = false;
+    private boolean darkMode = AppPrefs.isDarkMode();
     private boolean credsShown = false;
     private Protocol detectedProtocol;
     /** 前景色需跟随主题的次要标签（自定义前景色不会被 updateComponentTreeUI 自动替换） */
@@ -231,7 +232,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         onTextChange(searchField, this::applySearch);
         rightTools.add(searchField);
 
-        themeBtn = toolButton("深色主题", UiIcons.moon());
+        themeBtn = toolButton(darkMode ? "浅色主题" : "深色主题",
+                darkMode ? UiIcons.sun() : UiIcons.moon());
         themeBtn.addActionListener(e -> toggleTheme());
         rightTools.add(themeBtn);
 
@@ -597,6 +599,9 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         themeBtn.setText(darkMode ? "浅色主题" : "深色主题");
         themeBtn.setIcon(darkMode ? UiIcons.sun() : UiIcons.moon());
         taskTable.repaint();
+
+        // 持久化用户的主题选择，下次启动按此设置 L&F
+        AppPrefs.setDarkMode(darkMode);
     }
 
     // ══════════════════════════════════════════
@@ -1537,23 +1542,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                 updateChecking = false;
                 updateBtn.setEnabled(true);
                 if (result.hasUpdate) {
-                    int choice = JOptionPane.showOptionDialog(this,
-                            "发现新版本 v" + result.latestVersion + "\n当前版本 " + APP_VERSION + "\n\n是否前往下载？",
-                            "发现新版本",
-                            JOptionPane.YES_NO_OPTION,
-                            JOptionPane.INFORMATION_MESSAGE,
-                            null,
-                            new String[]{"前往下载", "稍后再说"},
-                            "前往下载");
-                    if (choice == JOptionPane.YES_OPTION && result.releaseUrl != null) {
-                        try {
-                            if (Desktop.isDesktopSupported()) {
-                                Desktop.getDesktop().browse(URI.create(result.releaseUrl));
-                            }
-                        } catch (IOException ex) {
-                            Toast.error(this, "无法打开浏览器");
-                        }
-                    }
+                    new UpdateDialog(this, result, APP_VERSION).setVisible(true);
                 } else if (manual) {
                     if (result.errorMsg != null) {
                         Toast.warning(this, "检查更新失败：" + result.errorMsg);
