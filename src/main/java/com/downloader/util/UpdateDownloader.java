@@ -239,12 +239,17 @@ public final class UpdateDownloader {
         }
     }
 
-    /** 默认下载目录：优先用户 Downloads 目录，不可用时回退程序工作目录。 */
+    /**
+     * 更新包保存目录：程序根目录下的 {@code updates} 文件夹（不存在时创建）。
+     * 若程序根目录不可写（如安装在 Program Files 且无权限），回退到用户主目录下的同名文件夹。
+     */
     public static File defaultDownloadDir() {
-        File downloads = new File(System.getProperty("user.home"), "Downloads");
-        if ((downloads.isDirectory() || downloads.mkdirs()) && downloads.canWrite()) {
-            return downloads;
+        File updatesDir = new File("updates").getAbsoluteFile();
+        if ((updatesDir.isDirectory() || updatesDir.mkdirs()) && updatesDir.canWrite()) {
+            return updatesDir;
         }
-        return new File(System.getProperty("user.dir"));
+        File fallback = new File(System.getProperty("user.home"), "OmniFetch-updates");
+        fallback.mkdirs();
+        return fallback;
     }
 }
