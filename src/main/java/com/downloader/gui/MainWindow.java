@@ -768,10 +768,29 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private void handleExit() {
         if (exiting) return;
         exiting = true;
-        int result = JOptionPane.showConfirmDialog(this,
-                "确定要退出？\n未完成的下载任务将被取消。",
-                "确认退出",
-                JOptionPane.OK_CANCEL_OPTION);
+        // Windows 下窗口最小化（挂后台）时直接弹模态对话框，对话框无法被激活：
+        // 只有原生标题栏、内容区空白且点击无响应（系统随后标记"无响应"幽灵窗口）。
+        // 先恢复窗口并置前；再延迟到 windowClosing 事件处理结束后弹窗。
+        if (getExtendedState() == JFrame.ICONIFIED) {
+            setExtendedState(JFrame.NORMAL);
+        }
+        setVisible(true);
+        toFront();
+        SwingUtilities.invokeLater(this::showExitConfirm);
+    }
+
+    private void showExitConfirm() {
+        int result;
+        try {
+            result = JOptionPane.showConfirmDialog(this,
+                    "确定要退出？\n未完成的下载任务将被取消。",
+                    "确认退出",
+                    JOptionPane.OK_CANCEL_OPTION);
+        } catch (RuntimeException e) {
+            // 弹窗异常时释放防重入标志，允许下次重试退出
+            exiting = false;
+            throw e;
+        }
 
         if (result == JOptionPane.OK_OPTION) {
             downloadManager.shutdown();

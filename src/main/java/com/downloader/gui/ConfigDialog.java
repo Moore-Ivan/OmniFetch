@@ -8,6 +8,7 @@ import javax.swing.*;
 import javax.swing.border.LineBorder;
 import javax.swing.border.TitledBorder;
 import java.awt.*;
+import java.io.File;
 import java.io.IOException;
 import java.text.ParseException;
 import java.util.HashMap;
@@ -58,6 +59,12 @@ public class ConfigDialog extends JDialog {
             addItemRow(groupPanel, item);
         }
 
+        // 插件分组追加"添加插件"按钮行：点击直接打开插件目录
+        JPanel pluginPanel = groupPanels.get("插件配置");
+        if (pluginPanel != null) {
+            addAddPluginRow(pluginPanel);
+        }
+
         for (JPanel groupPanel : groupPanels.values()) {
             groupPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
             content.add(groupPanel);
@@ -71,9 +78,9 @@ public class ConfigDialog extends JDialog {
         resetBtn.setFocusable(false);
         saveBtn.setFocusable(false);
         closeBtn.setFocusable(false);
-        resetBtn.setToolTipText("将所有配置项重置为默认值（不会立即写盘）");
+        resetBtn.setToolTipText("将所有配置项恢复为默认值并立即保存");
         saveBtn.setToolTipText("校验并保存配置，即时生效");
-        resetBtn.addActionListener(e -> resetToDefaults());
+        resetBtn.addActionListener(e -> confirmResetToDefaults());
         saveBtn.addActionListener(e -> save());
         closeBtn.addActionListener(e -> dispose());
 
@@ -151,6 +158,9 @@ public class ConfigDialog extends JDialog {
         gbc.fill = GridBagConstraints.NONE;
         if (item.type == ConfigType.NUMBER) {
             long current = parseClamped(item, configManager.getString(item.key, item.defaultValue));
+            // 注意：四个 long 实参命中 SpinnerNumberModel(double,...) 重载（宽化优先于装箱），
+            // 模型值为 Double，取值时必须按 Number.longValue() 转换（见 save()），
+            // 不能直接 toString 后 Long.parseLong（"5.0" 会解析失败）
             SpinnerNumberModel model = new SpinnerNumberModel(
                     current, item.min, item.max, item.step);
             JSpinner spinner = new JSpinner(model);
@@ -187,6 +197,69 @@ public class ConfigDialog extends JDialog {
         }
     }
 
+    /**
+     * 在插件分组追加"添加插件"按钮行。
+     * 按钮与上方输入控件列对齐，点击后在系统文件管理器中打开插件目录，
+     * 用户将插件 JAR 放入即可完成安装。
+     */
+    private void addAddPluginRow(JPanel groupPanel) {
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(6, 6, 6, 6);
+        gbc.anchor = GridBagConstraints.WEST;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.gridy = nextRow(groupPanel);
+
+        // 占位标签列，保持与上方输入控件对齐
+        gbc.gridx = 0;
+        gbc.weightx = 0;
+        JLabel spacer = new JLabel();
+        spacer.setPreferredSize(new Dimension(180, spacer.getPreferredSize().height));
+        groupPanel.add(spacer, gbc);
+
+        gbc.gridx = 1;
+        JButton addPluginBtn = new JButton("添加插件", UiIcons.folder());
+        addPluginBtn.setFocusable(false);
+        addPluginBtn.setToolTipText("打开插件目录，将插件 JAR 放入后重启程序即可生效");
+        addPluginBtn.addActionListener(e -> openPluginDirectory());
+        groupPanel.add(addPluginBtn, gbc);
+
+        // 操作说明列
+        gbc.gridx = 2;
+        gbc.weightx = 1;
+        JLabel hint = new JLabel("打开目录，放入插件 JAR");
+        hint.setForeground(UIManager.getColor("Label.disabledForeground"));
+        groupPanel.add(hint, gbc);
+    }
+
+    /**
+     * 打开插件目录：优先使用界面中当前填写的目录（未保存也可打开），
+     * 目录不存在时自动创建；通过系统文件管理器打开，失败时提示手动访问路径。
+     */
+    private void openPluginDirectory() {
+        String dirText = pluginDirField != null ? pluginDirField.getText().trim() : "";
+        if (dirText.isEmpty()) {
+            dirText = configManager.getString("plugin.dir", "plugins");
+        }
+        File dir = new File(dirText);
+        if (!dir.exists() && !dir.mkdirs()) {
+            JOptionPane.showMessageDialog(this,
+                    "无法创建插件目录：\n" + dir.getAbsolutePath(), "打开失败",
+                    JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        try {
+            if (!Desktop.isDesktopSupported()
+                    || !Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                throw new UnsupportedOperationException("当前平台不支持桌面打开操作");
+            }
+            Desktop.getDesktop().open(dir);
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this,
+                    "无法自动打开插件目录，请手动访问：\n" + dir.getAbsolutePath(),
+                    "打开失败", JOptionPane.WARNING_MESSAGE);
+        }
+    }
+
     /** 数值格式化：带千分位分隔符，提升大数字可读性 */
     private static String fmt(long v) {
         return String.format("%,d", v);
@@ -197,9 +270,30 @@ public class ConfigDialog extends JDialog {
         return rowCounters.merge(panel, 1, Integer::sum) - 1;
     }
 
+    /**
+     * "恢复默认"确认：点"否"或关闭弹窗则取消，不做任何改动；
+     * 点"是"则把界面重置为默认值并立即走保存流程写盘生效。
+     */
+    private void confirmResetToDefaults() {
+        int choice = JOptionPane.showOptionDialog(this,
+                "确定要将所有配置项恢复为默认值吗？\n恢复后将立即保存并生效，当前未保存的修改会丢失。",
+                "恢复默认",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                new Object[]{"是", "否"},
+                "是");
+        if (choice != JOptionPane.YES_OPTION) {
+            return;
+        }
+        resetToDefaults();
+        save();
+    }
+
     private void resetToDefaults() {
         for (Map.Entry<ConfigItem, JSpinner> entry : spinners.entrySet()) {
-            entry.getValue().setValue(entry.getKey().getDefaultAsLong());
+            // 模型为 Double 类型（见 addItemRow），传 Long 会与边界比较时 ClassCastException
+            entry.getValue().setValue((double) entry.getKey().getDefaultAsLong());
         }
         if (pluginEnabledBox != null) {
             pluginEnabledBox.setSelected(true);
@@ -224,7 +318,9 @@ public class ConfigDialog extends JDialog {
         Map<String, String> values = new HashMap<>();
         for (ConfigItem item : configManager.getConfigItems()) {
             if (item.type == ConfigType.NUMBER) {
-                values.put(item.key, spinners.get(item).getValue().toString());
+                // 以 Number 通用取值，兼容编辑器可能返回的 Long/Integer/Double
+                Number n = (Number) spinners.get(item).getValue();
+                values.put(item.key, Long.toString(n.longValue()));
             }
         }
         if (pluginEnabledBox != null) {
