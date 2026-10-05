@@ -1,6 +1,7 @@
 package com.downloader.gui;
 
 import com.downloader.util.FileUtils;
+import com.downloader.util.InstallerLauncher;
 import com.downloader.util.UpdateChecker;
 import com.downloader.util.UpdateChecker.Result;
 import com.downloader.util.UpdateChecker.Asset;
@@ -36,6 +37,8 @@ final class UpdateDialog extends JDialog {
     private UpdateDownloader downloader;
     private State state = State.READY;
     private String errorMessage;
+    /** 最近一次安装程序启动失败原因（展示在完成态状态栏，便于重试/排查） */
+    private String launchError;
 
     /** 是否处于后台模式（窗口隐藏，下载继续） */
     private boolean background;
@@ -244,7 +247,12 @@ final class UpdateDialog extends JDialog {
                 speedLabel.setText("已暂停");
             }
             case COMPLETED -> {
-                status("下载完成：" + installerFile.getName(), MainWindow.SUCCESS);
+                if (launchError != null) {
+                    status("自动启动安装程序失败，可点「立即安装」重试（原因：" + launchError + "）",
+                            MainWindow.WARNING);
+                } else {
+                    status("下载完成：" + installerFile.getName(), MainWindow.SUCCESS);
+                }
                 speedLabel.setText(" ");
                 addSecondaryButton("关闭", e -> dispose());
                 primaryButton = primaryButton("立即安装", UiIcons.download(16), e -> launchInstaller());
@@ -444,21 +452,46 @@ final class UpdateDialog extends JDialog {
             setState(State.ERROR);
             return;
         }
-        try {
-            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
-                Desktop.getDesktop().open(installerFile);
-                JOptionPane.showMessageDialog(this,
-                        "安装程序已启动，请按向导完成更新。\n如安装失败，请先退出本程序后重试。",
-                        "开始安装", JOptionPane.INFORMATION_MESSAGE);
-                dispose();
-            } else {
-                throw new UnsupportedOperationException("当前平台不支持桌面打开操作");
+        // 有效性校验：非 Windows 可执行文件（如下载到错误页面）时删除并允许重新下载
+        String invalid = checkInstallerValid();
+        if (invalid != null) {
+            if (!installerFile.delete()) {
+                System.err.println("无法删除无效安装包: " + installerFile.getAbsolutePath());
             }
-        } catch (Exception e) {
+            errorMessage = invalid;
+            setState(State.ERROR);
+            return;
+        }
+        String error = InstallerLauncher.launch(installerFile);
+        if (error == null) {
             JOptionPane.showMessageDialog(this,
-                    "无法自动启动安装程序，请手动双击运行：\n" + installerFile.getAbsolutePath(),
+                    "安装程序已启动，请按向导完成更新。\n如安装失败，请先退出本程序后重试。",
+                    "开始安装", JOptionPane.INFORMATION_MESSAGE);
+            dispose();
+        } else {
+            launchError = error;
+            JOptionPane.showMessageDialog(this,
+                    "无法自动启动安装程序，请手动双击运行：\n" + installerFile.getAbsolutePath()
+                            + "\n\n失败原因：" + error,
                     "启动失败", JOptionPane.WARNING_MESSAGE);
         }
+    }
+
+    /** 校验 .exe 安装包的 PE 头（MZ）；有效返回 null，异常返回原因。 */
+    private String checkInstallerValid() {
+        if (!installerFile.getName().toLowerCase(Locale.ROOT).endsWith(".exe")) {
+            return null;
+        }
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(installerFile, "r")) {
+            int b0 = raf.read();
+            int b1 = raf.read();
+            if (b0 != 'M' || b1 != 'Z') {
+                return "安装包不是有效的 Windows 可执行文件（可能下载到的是错误页面），已删除，请重试";
+            }
+        } catch (java.io.IOException e) {
+            return "无法读取安装包：" + e.getMessage();
+        }
+        return null;
     }
 
     // ══════ 后台模式 ══════
@@ -497,20 +530,26 @@ final class UpdateDialog extends JDialog {
         if (installerFile == null || !installerFile.exists()) {
             return;
         }
-        boolean launched = false;
-        try {
-            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
-                Desktop.getDesktop().open(installerFile);
-                launched = true;
+        String invalid = checkInstallerValid();
+        if (invalid != null) {
+            if (!installerFile.delete()) {
+                System.err.println("无法删除无效安装包: " + installerFile.getAbsolutePath());
             }
-        } catch (Exception ignored) {
-            launched = false;
+            errorMessage = invalid;
+            setState(State.ERROR);
+            Toast.warning(owner, "更新安装包内容异常，已打开更新窗口，请重新下载");
+            bringToFront();
+            return;
         }
-        if (launched) {
+        String error = InstallerLauncher.launch(installerFile);
+        if (error == null) {
             Toast.success(owner, "更新安装包已下载完成，安装程序已启动，请按向导完成更新");
             dispose();
         } else {
-            Toast.warning(owner, "无法自动启动安装程序，请在更新窗口中手动安装");
+            launchError = error;
+            status("无法自动启动安装程序，可点「立即安装」重试或手动运行：" + installerFile.getAbsolutePath()
+                    + "（原因：" + error + "）", MainWindow.WARNING);
+            Toast.warning(owner, "无法自动启动安装程序，已打开更新窗口");
             bringToFront();
         }
     }
