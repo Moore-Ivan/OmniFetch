@@ -274,6 +274,8 @@ final class UpdateDialog extends JDialog {
     private void status(String text, Color color) {
         statusLabel.setText(text);
         statusLabel.setForeground(color != null ? color : UIManager.getColor("Label.foreground"));
+        // 状态行空间有限（如 PKIX 长报错会被截断），悬停可查看完整内容
+        statusLabel.setToolTipText(text);
     }
 
     // ══════ 下载控制 ══════

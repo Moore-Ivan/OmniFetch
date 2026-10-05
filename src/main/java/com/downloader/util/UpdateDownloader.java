@@ -118,6 +118,11 @@ public final class UpdateDownloader {
             downloaded = existing;
 
             conn = (HttpURLConnection) URI.create(fileUrl).toURL().openConnection();
+            // 信任所有证书（GitHub 资源会重定向到 objects.githubusercontent.com，
+            // 同一重定向链内的连接都会沿用该 SSL 配置），解决 cacerts 不完整时的 PKIX 失败
+            if (conn instanceof javax.net.ssl.HttpsURLConnection https) {
+                HttpTrust.apply(https);
+            }
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
             conn.setRequestProperty("User-Agent", "OmniFetch-Updater");
