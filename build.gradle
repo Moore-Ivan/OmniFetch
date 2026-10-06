@@ -27,12 +27,17 @@ ext.cfgLibDir = layout.buildDirectory.dir("install/${cfgAppName}/lib").get().asF
 
 // ============================================================
 // 【动态 JRE】: 模块列表由 jdeps 自动分析得出
+// 注意：jdk.crypto.ec 是 ECDHE 密钥交换（SunEC 提供方）的实现，
+// 现代 TLS 服务器（GitHub 等）只支持 ECDHE 密码套件，缺少该模块会导致
+// 打包后的 exe 访问 HTTPS 时报 handshake_failure。必须显式包含。
 // ============================================================
 ext.cfgJreExtraModules = [
         'java.base',
         'java.desktop',
         'jdk.unsupported',
-        'jdk.localedata'
+        'jdk.localedata',
+        'jdk.crypto.ec',
+        'jdk.crypto.mscapi'
 ]
 
 project.version = cfgVersion
