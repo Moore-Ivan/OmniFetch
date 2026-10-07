@@ -15,7 +15,7 @@ ext.isMacOs     = System.getProperty('os.name').toLowerCase().contains('mac')
 // ============================================================
 ext.cfgAppName = 'OmniFetch'
 ext.cfgDisplayName = '万象抓取'
-ext.cfgVersion = '1.1.1'
+ext.cfgVersion = '1.0.0'
 ext.cfgMainClass = 'com.downloader.Main'
 ext.cfgVendor = 'Ivan'
 ext.cfgMainJarName = "${cfgAppName}-${cfgVersion}.jar"

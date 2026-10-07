@@ -117,22 +117,40 @@ public final class UpdateDownloader {
             long existing = partFile.exists() ? partFile.length() : 0;
             downloaded = existing;
 
-            conn = (HttpURLConnection) URI.create(fileUrl).toURL().openConnection();
-            // 信任所有证书（GitHub 资源会重定向到 objects.githubusercontent.com，
-            // 同一重定向链内的连接都会沿用该 SSL 配置），解决 cacerts 不完整时的 PKIX 失败
-            if (conn instanceof javax.net.ssl.HttpsURLConnection https) {
-                HttpTrust.apply(https);
+            // 手动跟随重定向：GitHub 资产会 302 到 objects.githubusercontent.com。
+            // 不用自动跟随的原因：
+            // 1) 自动跟随打开的新连接不会继承 HttpTrust 的信任配置（精简 JRE cacerts 不全时重定向后 PKIX）；
+            // 2) 手动跟随可在连接被拒时指出具体主机（hosts 失效/代理未开/防火墙的排查依据）
+            String currentUrl = fileUrl;
+            int code;
+            int redirects = 0;
+            while (true) {
+                conn = openConnection(currentUrl, existing);
+                try {
+                    code = conn.getResponseCode();
+                } catch (java.io.IOException e) {
+                    throw enrichConnectionError(currentUrl, e);
+                }
+                if (code >= 300 && code < 400) {
+                    String location = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    conn = null;
+                    if (location == null || location.isBlank()) {
+                        throw new java.io.IOException("服务器重定向响应缺少 Location 头");
+                    }
+                    if (redirects++ >= 10) {
+                        throw new java.io.IOException("重定向次数过多（超过 10 次）");
+                    }
+                    currentUrl = URI.create(currentUrl).resolve(location).toString();
+                    String lower = currentUrl.toLowerCase(java.util.Locale.ROOT);
+                    if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
+                        throw new java.io.IOException("重定向地址协议不受支持：" + currentUrl);
+                    }
+                    continue;
+                }
+                break;
             }
-            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(READ_TIMEOUT_MS);
-            conn.setRequestProperty("User-Agent", "OmniFetch-Updater");
-            conn.setInstanceFollowRedirects(true);
-            if (existing > 0) {
-                conn.setRequestProperty("Range", "bytes=" + existing + "-");
-            }
-            conn.connect();
 
-            int code = conn.getResponseCode();
             if (code == 206) {
                 // 断点续传：优先从 Content-Range 取总大小
                 total = parseTotalFromContentRange(conn.getHeaderField("Content-Range"));
@@ -222,6 +240,64 @@ public final class UpdateDownloader {
         } finally {
             clearWorker();
         }
+    }
+
+    /**
+     * 建立一次下载连接（重定向链中的每一跳都调用本方法），
+     * 确保 HttpTrust 信任配置作用于最终资源主机，并统一携带 UA 与 Range。
+     */
+    private static HttpURLConnection openConnection(String urlStr, long existing)
+            throws java.io.IOException {
+        HttpURLConnection conn;
+        try {
+            conn = (HttpURLConnection) URI.create(urlStr).toURL().openConnection();
+        } catch (IllegalArgumentException e) {
+            throw new java.io.IOException("下载地址无效：" + urlStr, e);
+        }
+        // 信任所有证书（含重定向后的 objects.githubusercontent.com）
+        if (conn instanceof javax.net.ssl.HttpsURLConnection https) {
+            HttpTrust.apply(https);
+        }
+        conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(READ_TIMEOUT_MS);
+        conn.setRequestProperty("User-Agent", "OmniFetch-Updater");
+        conn.setInstanceFollowRedirects(false); // 由调用方手动跟随
+        if (existing > 0) {
+            conn.setRequestProperty("Range", "bytes=" + existing + "-");
+        }
+        try {
+            conn.connect();
+        } catch (java.io.IOException e) {
+            conn.disconnect();
+            throw enrichConnectionError(urlStr, e);
+        }
+        return conn;
+    }
+
+    /**
+     * 把连接阶段的底层异常翻译成带主机信息与排查建议的错误：
+     * DNS 失败 / 连接被拒是 GitHub 资源 CDN 最常见的两类网络问题。
+     */
+    private static java.io.IOException enrichConnectionError(String urlStr, java.io.IOException e) {
+        String host;
+        try {
+            host = URI.create(urlStr).getHost();
+        } catch (Exception ex) {
+            return e;
+        }
+        if (host == null) {
+            return e;
+        }
+        String hint;
+        if (e instanceof java.net.UnknownHostException) {
+            hint = "无法解析域名 " + host + "（DNS 解析失败），请检查网络连接、系统代理或 hosts 文件";
+        } else if (e instanceof java.net.ConnectException) {
+            hint = "无法连接 " + host + "（连接被拒绝）。常见原因：系统代理/VPN 未开启或端口已失效、"
+                    + "hosts 文件中的 GitHub 加速条目失效、防火墙拦截；也可点「查看发布页」手动下载";
+        } else {
+            return e;
+        }
+        return new java.io.IOException(hint, e);
     }
 
     /** 解析形如 {@code bytes 100-199/1000} 的 Content-Range 总长度，失败返回 -1。 */

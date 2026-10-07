@@ -27,6 +27,12 @@ public class Main {
     }
 
     public static void main(String[] args) {
+        // 桌面应用跟随操作系统代理设置（Clash/v2ray、公司代理等）。
+        // JVM 默认忽略系统代理强制直连，会出现"浏览器能访问 GitHub，
+        // 打包应用却连接被拒/超时"；未配置系统代理时代理选择器返回直连，无副作用。
+        // 必须在任何网络类加载前设置（DefaultProxySelector 初始化时读取该属性）
+        System.setProperty("java.net.useSystemProxies", "true");
+
         // Windows 下中文渲染优化：指定雅黑 UI 字体（经 FlatLaf 全局默认值，
         // 保留其 HiDPI 每显示器缩放能力；通过 system property 适配未来多语言扩展）
         if (System.getProperty("os.name", "").toLowerCase().contains("windows")) {
