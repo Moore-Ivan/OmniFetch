@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -59,6 +60,11 @@ public class HttpDownloader implements DownloadProtocol {
         return configManager.getLong("http.maxChunkSize", 52428800); // 50MB
     }
 
+    private String getUserAgent() {
+        return configManager.getString("http.userAgent",
+                "Mozilla/5.0 (MultiProtocolDownloader/2.0)");
+    }
+
     public HttpDownloader(String fileURL, String savePath,
                           ProgressCallback callback) {
         this.fileURL = fileURL;
@@ -99,8 +105,7 @@ public class HttpDownloader implements DownloadProtocol {
         // 先发送 HEAD 请求获取文件信息
         HttpRequest headRequest = HttpRequest.newBuilder()
                 .uri(URI.create(fileURL))
-                .header("User-Agent",
-                        "Mozilla/5.0 (MultiProtocolDownloader/2.0)")
+                .header("User-Agent", getUserAgent())
                 .header("Accept", "*/*")
                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                 .build();
@@ -166,91 +171,92 @@ public class HttpDownloader implements DownloadProtocol {
 
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         downloadFutures = new ArrayList<>();
-        AtomicLong downloadedTotal = new AtomicLong(downloadedSize);
-        long lastTime = System.currentTimeMillis();
-        long lastBytes = downloadedSize;
+        AtomicLong downloadedTotal = new AtomicLong(0);
+        AtomicInteger failedChunks = new AtomicInteger(0);
 
-        for (int i = 0; i < threadCount; i++) {
-            final long start = i * chunkSize;
-            final long end = (i == threadCount - 1) ? totalSize - 1 : (i + 1) * chunkSize - 1;
-            final int threadIndex = i;
+        try {
+            for (int i = 0; i < threadCount; i++) {
+                final long start = i * chunkSize;
+                final long end = (i == threadCount - 1) ? totalSize - 1 : (i + 1) * chunkSize - 1;
+                final int threadIndex = i;
 
-            // 跳过已下载的部分
-            if (start >= totalSize) {
-                continue;
+                // 跳过超出文件末尾的分片
+                if (start >= totalSize) {
+                    continue;
+                }
+
+                Future<?> future = executor.submit(() -> {
+                    try {
+                        if (!cancelled) {
+                            downloadChunk(saveFile, start, end, downloadedTotal);
+                        }
+                    } catch (Exception e) {
+                        failedChunks.incrementAndGet();
+                        if (!cancelled) {
+                            System.err.println("分片 " + threadIndex + " 下载失败: " + e.getMessage());
+                        }
+                    }
+                });
+                downloadFutures.add(future);
             }
 
-            Future<?> future = executor.submit(() -> {
-                try {
-                    if (!cancelled) {
-                        downloadChunk(saveFile, start, end, downloadedTotal);
-                    }
-                } catch (Exception e) {
-                    if (!cancelled) {
-                        // 不立即标记任务失败，让其他线程继续下载
-                        System.err.println("线程 " + threadIndex + " 下载失败: " + e.getMessage());
+            // 监控进度：只在有字节数增长时刷新活动时间，避免"零进度也刷新"导致停滞检测失效
+            long lastTime = System.currentTimeMillis();
+            long lastBytes = 0;
+            long lastProgressBytes = 0;
+            long lastProgressTime = System.currentTimeMillis();
+            while (!cancelled) {
+                boolean allDone = true;
+                for (Future<?> future : downloadFutures) {
+                    if (!future.isDone()) {
+                        allDone = false;
+                        break;
                     }
                 }
-            });
-            downloadFutures.add(future);
+                if (allDone) {
+                    break;
+                }
+                long now = System.currentTimeMillis();
+                long downloaded = downloadedTotal.get();
+                if (now - lastTime >= getProgressIntervalMs()) {
+                    long speed = (long) ((downloaded - lastBytes) * 1000.0 / (now - lastTime));
+                    callback.onProgress(downloaded, totalSize, speed);
+                    lastTime = now;
+                    lastBytes = downloaded;
+                }
+                if (downloaded != lastProgressBytes) {
+                    lastProgressBytes = downloaded;
+                    lastProgressTime = now;
+                } else if (now - lastProgressTime > 60_000) {
+                    throw new IOException("下载停滞超过 60 秒，已中止本次尝试");
+                }
+                Thread.sleep(100);
+            }
+
+            // 有界等待分片线程收尾，避免无限阻塞
+            for (Future<?> future : downloadFutures) {
+                try {
+                    future.get(10, TimeUnit.SECONDS);
+                } catch (TimeoutException e) {
+                    future.cancel(true);
+                } catch (Exception ignored) {
+                }
+            }
+        } finally {
+            // 无论完成、取消还是异常都必须关闭线程池，避免线程泄漏
+            executor.shutdownNow();
         }
 
-        // 监控进度
-        long lastProgressUpdate = System.currentTimeMillis();
-        while (!cancelled && downloadedTotal.get() < totalSize) {
-            long now = System.currentTimeMillis();
-            if (now - lastTime >= getProgressIntervalMs()) {
-                long downloaded = downloadedTotal.get();
-                long speed = (long) ((downloaded - lastBytes) * 1000.0 / (now - lastTime));
-                callback.onProgress(downloaded, totalSize, speed);
-                lastTime = now;
-                lastBytes = downloaded;
-                lastProgressUpdate = now;
-            }
-            // 检查是否超过60秒没有进度更新，超时退出
-            if (now - lastProgressUpdate > 60000) {
-                break;
-            }
-            Thread.sleep(100);
-        }
-        
-        // 如果已取消，立即退出
         if (cancelled) {
             return;
         }
-        
-        // 检查下载完成情况，允许99%以上就算完成
+        // 分片失败或数据不完整都视为失败（走统一重试），绝不允许"假完成"产生损坏文件
+        if (failedChunks.get() > 0) {
+            throw new IOException(failedChunks.get() + " 个分片下载失败");
+        }
         long downloaded = downloadedTotal.get();
-        if (downloaded >= totalSize * 99 / 100) {
-            // 认为下载完成
-            return;
-        }
-
-        // 等待所有线程完成，但设置超时
-        for (Future<?> future : downloadFutures) {
-            try {
-                // 如果已取消，不等待线程完成
-                if (!cancelled) {
-                    // 设置5秒超时，避免卡在最后
-                    future.get(5, TimeUnit.SECONDS);
-                } else {
-                    future.cancel(true);
-                }
-            } catch (TimeoutException e) {
-                // 超时异常，取消该线程
-                future.cancel(true);
-            } catch (Exception e) {
-                // 忽略所有异常，让其他线程继续完成
-                System.err.println("线程完成时出现异常: " + e.getMessage());
-            }
-        }
-
-        executor.shutdownNow();
-        try {
-            // 减少等待时间
-            executor.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (downloaded < totalSize) {
+            throw new IOException("分片下载不完整: " + downloaded + "/" + totalSize + " 字节");
         }
     }
     
@@ -264,7 +270,7 @@ public class HttpDownloader implements DownloadProtocol {
         
         HttpRequest testRequest = HttpRequest.newBuilder()
                 .uri(URI.create(fileURL))
-                .header("User-Agent", "Mozilla/5.0 (MultiProtocolDownloader/2.0)")
+                .header("User-Agent", getUserAgent())
                 .header("Accept", "*")
                 .header("Range", "bytes=0-2097151") // 测试2MB，增加测试数据量
                 .GET()
@@ -334,140 +340,116 @@ public class HttpDownloader implements DownloadProtocol {
         return finalChunkSize;
     }
 
-    private void downloadChunk(File saveFile, long start, long end, AtomicLong downloadedTotal) {
-        // 检查是否已取消
+    /**
+     * 下载单个分片。任何失败都抛出异常（由调用方计数并触发统一重试），
+     * 保证不完整的数据永远不会被标记为完成。
+     */
+    private void downloadChunk(File saveFile, long start, long end, AtomicLong downloadedTotal) throws Exception {
+        long expected = end - start + 1;
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(fileURL))
+                .header("User-Agent", getUserAgent())
+                .header("Accept", "*/*")
+                .header("Range", "bytes=" + start + "-" + end)
+                .GET()
+                .build();
+
         if (cancelled) {
             return;
-        }
-
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(fileURL))
-                    .header("User-Agent",
-                            "Mozilla/5.0 (MultiProtocolDownloader/2.0)")
-                    .header("Accept", "*/*")
-                    .header("Range", "bytes=" + start + "-" + end)
-                    .GET()
-                    .build();
-
-            // 检查是否已取消
-            if (cancelled) {
-                return;
-            }
-
-            HttpResponse<InputStream> response = httpClient.send(
-                    request, HttpResponse.BodyHandlers.ofInputStream());
-
-            // 检查是否已取消
-            if (cancelled) {
-                return;
-            }
-
-            if (response.statusCode() != 206) {
-                System.err.println("HTTP " + response.statusCode() + " (Expected 206 for range request)");
-                return;
-            }
-
-            try (InputStream in = response.body();
-                 FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE)) {
-                
-                // 使用FileChannel.transferFrom实现零拷贝
-                long currentPosition = start;
-                long lastActivityTime = System.currentTimeMillis();
-                long lastFlushTime = System.currentTimeMillis();
-                
-                // 创建ReadableByteChannel从输入流
-                try (ReadableByteChannel inChannel = Channels.newChannel(in)) {
-                    while (!cancelled) {
-                        // 检查是否有数据可读
-                        if (in.available() > 0) {
-                            try {
-                                // 零拷贝传输数据
-                                long transferred = fileChannel.transferFrom(
-                                        inChannel, currentPosition, getBufferSize());
-                                
-                                if (transferred == 0) {
-                                    break; // 没有更多数据
-                                }
-                                
-                                downloadedTotal.addAndGet(transferred);
-                                currentPosition += transferred;
-                                lastActivityTime = System.currentTimeMillis();
-                                
-                                // 按照配置的间隔刷新缓冲区
-                                if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
-                                    fileChannel.force(true); // 强制刷新到磁盘
-                                    lastFlushTime = System.currentTimeMillis();
-                                }
-                            } catch (Exception e) {
-                                // 读取或写入失败，退出该线程
-                                System.err.println("数据读写失败: " + e.getMessage());
-                                break;
-                            }
-                        } else {
-                            // 检查是否超过30秒没有活动，超时退出
-                            if (System.currentTimeMillis() - lastActivityTime > 30000) {
-                                break;
-                            }
-                            // 短暂休眠，避免CPU占用过高
-                            try {
-                                Thread.sleep(10);
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            // 捕获所有异常，避免线程崩溃
-            if (!cancelled) {
-                System.err.println("线程下载失败: " + e.getMessage());
-            }
-        }
-    }
-
-    private void downloadWithSingleThread(File saveFile) throws Exception {
-        HttpRequest request;
-        long totalSize;
-        long start = downloadedSize;
-
-        if (start > 0) {
-            // 支持断点续传，发送Range请求
-            request = HttpRequest.newBuilder()
-                    .uri(URI.create(fileURL))
-                    .header("User-Agent",
-                            "Mozilla/5.0 (MultiProtocolDownloader/2.0)")
-                    .header("Accept", "*/*")
-                    .header("Range", "bytes=" + start + "-")
-                    .GET()
-                    .build();
-        } else {
-            // 正常请求
-            request = HttpRequest.newBuilder()
-                    .uri(URI.create(fileURL))
-                    .header("User-Agent",
-                            "Mozilla/5.0 (MultiProtocolDownloader/2.0)")
-                    .header("Accept", "*/*")
-                    .GET()
-                    .build();
         }
 
         HttpResponse<InputStream> response = httpClient.send(
                 request, HttpResponse.BodyHandlers.ofInputStream());
 
-        if (start > 0) {
-            if (response.statusCode() != 206) {
-                throw new IOException("HTTP " + response.statusCode() + " (Expected 206 for range request)");
-            }
-        } else {
-            if (response.statusCode() != 200) {
-                throw new IOException("HTTP " + response.statusCode());
-            }
+        if (cancelled) {
+            response.body().close();
+            return;
         }
 
-        totalSize = response.headers()
+        if (response.statusCode() != 206) {
+            response.body().close();
+            throw new IOException("HTTP " + response.statusCode() + "（分片请求期望 206）");
+        }
+
+        try (InputStream in = response.body();
+             FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE);
+             ReadableByteChannel inChannel = Channels.newChannel(in)) {
+
+            long currentPosition = start;
+            long transferredTotal = 0;
+            long lastActivityTime = System.currentTimeMillis();
+            long lastFlushTime = System.currentTimeMillis();
+
+            while (transferredTotal < expected) {
+                if (cancelled) {
+                    return;
+                }
+                if (in.available() > 0) {
+                    // 零拷贝传输数据
+                    long transferred = fileChannel.transferFrom(
+                            inChannel, currentPosition, getBufferSize());
+
+                    if (transferred == 0) {
+                        throw new IOException("数据流意外提前结束");
+                    }
+
+                    downloadedTotal.addAndGet(transferred);
+                    currentPosition += transferred;
+                    transferredTotal += transferred;
+                    lastActivityTime = System.currentTimeMillis();
+
+                    // 按照配置的间隔刷新缓冲区
+                    if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
+                        fileChannel.force(true); // 强制刷新到磁盘
+                        lastFlushTime = System.currentTimeMillis();
+                    }
+                } else {
+                    // 超过 30 秒没有任何数据视为连接停滞，抛错触发重试
+                    if (System.currentTimeMillis() - lastActivityTime > 30_000) {
+                        throw new IOException("连接 30 秒无数据");
+                    }
+                    Thread.sleep(10);
+                }
+            }
+        }
+    }
+
+    private void downloadWithSingleThread(File saveFile) throws Exception {
+        long start = downloadedSize;
+
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(fileURL))
+                .header("User-Agent", getUserAgent())
+                .header("Accept", "*/*");
+        if (start > 0) {
+            // 支持断点续传，发送Range请求
+            builder.header("Range", "bytes=" + start + "-");
+        }
+        HttpRequest request = builder.GET().build();
+
+        if (cancelled) {
+            return;
+        }
+
+        HttpResponse<InputStream> response = httpClient.send(
+                request, HttpResponse.BodyHandlers.ofInputStream());
+
+        if (cancelled) {
+            response.body().close();
+            return;
+        }
+
+        if (start > 0 && response.statusCode() != 206) {
+            response.body().close();
+            throw new IOException("HTTP " + response.statusCode() + "（续传请求期望 206）");
+        }
+        if (start == 0 && response.statusCode() != 200) {
+            response.body().close();
+            throw new IOException("HTTP " + response.statusCode());
+        }
+
+        long totalSize = response.headers()
                 .firstValueAsLong("Content-Length").orElse(-1);
 
         // 如果是续传，需要计算实际的总大小
@@ -476,66 +458,61 @@ public class HttpDownloader implements DownloadProtocol {
         }
 
         try (InputStream in = response.body();
-             FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE)) {
-            
-            // 使用FileChannel.transferFrom实现零拷贝
+             FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE);
+             ReadableByteChannel inChannel = Channels.newChannel(in)) {
+
             long downloaded = start;
-            long currentPosition = start;
             long lastTime = System.currentTimeMillis();
             long lastBytes = start;
             long lastActivityTime = System.currentTimeMillis();
             long lastFlushTime = System.currentTimeMillis();
 
-            // 创建ReadableByteChannel从输入流
-            try (ReadableByteChannel inChannel = Channels.newChannel(in)) {
-                while (!cancelled) {
-                    // 检查是否有数据可读
-                    if (in.available() > 0) {
-                        try {
-                            // 零拷贝传输数据
-                            long transferred = fileChannel.transferFrom(
-                                    inChannel, currentPosition, getBufferSize());
-                            
-                            if (transferred == 0) {
-                                break; // 没有更多数据
-                            }
-                            
-                            downloaded += transferred;
-                            currentPosition += transferred;
-                            lastActivityTime = System.currentTimeMillis();
-                            
-                            // 按照配置的间隔刷新缓冲区
-                            if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
-                                fileChannel.force(true); // 强制刷新到磁盘
-                                lastFlushTime = System.currentTimeMillis();
-                            }
+            while (!cancelled) {
+                // 总大小已知且已下满则结束
+                if (totalSize > 0 && downloaded >= totalSize) {
+                    break;
+                }
+                if (in.available() > 0) {
+                    // 零拷贝传输数据
+                    long transferred = fileChannel.transferFrom(
+                            inChannel, downloaded, getBufferSize());
 
-                            long now = System.currentTimeMillis();
-                            if (now - lastTime >= getProgressIntervalMs()) {
-                                long speed = (long) ((downloaded - lastBytes)
-                                        * 1000.0 / (now - lastTime));
-                                callback.onProgress(downloaded, totalSize, speed);
-                                lastTime = now;
-                                lastBytes = downloaded;
-                            }
-                        } catch (Exception e) {
-                            // 读取或写入失败，退出
-                            System.err.println("数据读写失败: " + e.getMessage());
-                            break;
-                        }
-                    } else {
-                        // 检查是否超过30秒没有活动，超时退出
-                        if (System.currentTimeMillis() - lastActivityTime > 30000) {
-                            break;
-                        }
-                        // 短暂休眠，避免CPU占用过高
-                        Thread.sleep(10);
+                    if (transferred == 0) {
+                        break; // 服务器关闭连接，数据流结束
                     }
-                }
 
-                if (cancelled) {
-                    return;
+                    downloaded += transferred;
+                    lastActivityTime = System.currentTimeMillis();
+
+                    // 按照配置的间隔刷新缓冲区
+                    if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
+                        fileChannel.force(true); // 强制刷新到磁盘
+                        lastFlushTime = System.currentTimeMillis();
+                    }
+
+                    long now = System.currentTimeMillis();
+                    if (now - lastTime >= getProgressIntervalMs()) {
+                        long speed = (long) ((downloaded - lastBytes)
+                                * 1000.0 / (now - lastTime));
+                        callback.onProgress(downloaded, totalSize, speed);
+                        lastTime = now;
+                        lastBytes = downloaded;
+                    }
+                } else {
+                    // 超过 30 秒没有任何数据视为连接停滞，抛错触发重试
+                    if (System.currentTimeMillis() - lastActivityTime > 30_000) {
+                        throw new IOException("连接 30 秒无数据");
+                    }
+                    Thread.sleep(10);
                 }
+            }
+
+            if (cancelled) {
+                return;
+            }
+            // 总大小已知但没下满：视为失败并重试，绝不允许静默截断的"完成"
+            if (totalSize > 0 && downloaded < totalSize) {
+                throw new IOException("下载不完整: " + downloaded + "/" + totalSize + " 字节");
             }
         }
     }
@@ -552,7 +529,8 @@ public class HttpDownloader implements DownloadProtocol {
 
     @Override
     public void close() {
-        httpClient = null;
+        // 不置空 httpClient：正在运行的分片线程仍在使用该实例，
+        // 置空会在读取时触发 NPE 导致线程意外终止
         downloadFutures = null;
     }
 }

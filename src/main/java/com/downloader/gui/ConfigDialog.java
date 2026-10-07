@@ -11,23 +11,29 @@ import java.awt.*;
 import java.io.File;
 import java.io.IOException;
 import java.text.ParseException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
  * 高级配置对话框
  * 分组卡片展示全部配置项；数值项使用带最小/最大阈值的 JSpinner，
+ * 布尔项使用复选框、文本项使用输入框（均按注册表自动泛化，新增配置项无需改界面），
  * 提供"恢复默认"和"保存当前"操作，保存后即时写入 config/application.properties 并热生效。
  */
 public class ConfigDialog extends JDialog {
 
     private final ConfigManager configManager = ConfigManager.getInstance();
     private final Map<ConfigItem, JSpinner> spinners = new HashMap<>();
-    /** 各分组面板已使用的行数 */
-    private final Map<JPanel, Integer> rowCounters = new HashMap<>();
-    private JCheckBox pluginEnabledBox;
-    private JTextField pluginDirField;
+    private final Map<ConfigItem, JCheckBox> checkBoxes = new HashMap<>();
+    private final Map<ConfigItem, JTextField> textFields = new HashMap<>();
+    /** 各分组面板（标题 → 面板），换肤时重建边框与配色 */
+    private final Map<String, JPanel> groupPanels = new LinkedHashMap<>();
+    /** 前景色需跟随主题的次要标签（范围提示、说明文字等） */
+    private final List<JLabel> hintLabels = new ArrayList<>();
+    private JLabel pathHint;
 
     public ConfigDialog(Window owner) {
         super(owner, "高级配置", ModalityType.APPLICATION_MODAL);
@@ -44,18 +50,17 @@ public class ConfigDialog extends JDialog {
         content.setBorder(BorderFactory.createEmptyBorder(18, 18, 16, 18));
 
         // 配置文件位置提示
-        JLabel pathHint = new JLabel("<html><body>配置文件：<code>"
+        pathHint = new JLabel("<html><body>配置文件：<code>"
                 + configManager.getConfigPath().toAbsolutePath()
                 + "</code></body></html>");
-        pathHint.setForeground(UIManager.getColor("Label.disabledForeground"));
+        styleHint(pathHint);
         pathHint.setAlignmentX(Component.LEFT_ALIGNMENT);
         pathHint.setBorder(BorderFactory.createEmptyBorder(0, 2, 12, 0));
         content.add(pathHint);
 
         // 按分组构建表单（保持注册顺序）
-        Map<String, JPanel> groupPanels = new LinkedHashMap<>();
         for (ConfigItem item : configManager.getConfigItems()) {
-            JPanel groupPanel = groupPanels.computeIfAbsent(item.group, g -> createGroupPanel(g));
+            JPanel groupPanel = groupPanels.computeIfAbsent(item.group, this::createGroupPanel);
             addItemRow(groupPanel, item);
         }
 
@@ -109,10 +114,16 @@ public class ConfigDialog extends JDialog {
 
     /**
      * 创建分组面板：圆角边框 + 粗体标题，视觉层次清晰。
-     * 标题色取自 FlatLaf 前景色，换肤时随主题刷新。
+     * 标题色取自 FlatLaf 前景色，换肤时随主题刷新（见 refreshTheme）。
      */
     private JPanel createGroupPanel(String title) {
         JPanel p = new JPanel(new GridBagLayout());
+        restyleGroupPanel(p, title);
+        return p;
+    }
+
+    /** 按当前主题应用分组面板的边框、标题色与背景色 */
+    private void restyleGroupPanel(JPanel p, String title) {
         TitledBorder titled = BorderFactory.createTitledBorder(
                 BorderFactory.createEmptyBorder(8, 10, 8, 10), title,
                 TitledBorder.LEFT, TitledBorder.TOP);
@@ -135,7 +146,26 @@ public class ConfigDialog extends JDialog {
         if (bg != null) {
             p.setBackground(bg);
         }
-        return p;
+    }
+
+    /** 换肤回调（由 MainWindow.applyTheme 调用）：刷新卡片边框与次要文字颜色 */
+    public void refreshTheme() {
+        for (Map.Entry<String, JPanel> entry : groupPanels.entrySet()) {
+            restyleGroupPanel(entry.getValue(), entry.getKey());
+        }
+        Color hint = UIManager.getColor("Label.disabledForeground");
+        for (JLabel label : hintLabels) {
+            label.setForeground(hint != null ? hint : label.getForeground());
+        }
+        repaint();
+    }
+
+    /** 统一创建并登记次要文字标签，换肤时统一刷新 */
+    private JLabel styleHint(JLabel label) {
+        Color hint = UIManager.getColor("Label.disabledForeground");
+        label.setForeground(hint != null ? hint : Color.GRAY);
+        hintLabels.add(label);
+        return label;
     }
 
     private void addItemRow(JPanel groupPanel, ConfigItem item) {
@@ -156,44 +186,61 @@ public class ConfigDialog extends JDialog {
         gbc.gridx = 1;
         gbc.weightx = 0;
         gbc.fill = GridBagConstraints.NONE;
-        if (item.type == ConfigType.NUMBER) {
-            long current = parseClamped(item, configManager.getString(item.key, item.defaultValue));
-            // 注意：四个 long 实参命中 SpinnerNumberModel(double,...) 重载（宽化优先于装箱），
-            // 模型值为 Double，取值时必须按 Number.longValue() 转换（见 save()），
-            // 不能直接 toString 后 Long.parseLong（"5.0" 会解析失败）
-            SpinnerNumberModel model = new SpinnerNumberModel(
-                    current, item.min, item.max, item.step);
-            JSpinner spinner = new JSpinner(model);
-            // 整数显示，带千分位分隔符，大数字更易读
-            JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "#,###");
-            spinner.setEditor(editor);
-            editor.getTextField().setColumns(8);
-            spinner.setToolTipText(String.format("允许范围：%s ~ %s，默认值：%s",
-                    fmt(item.min), fmt(item.max), fmt(item.getDefaultAsLong())));
-            spinners.put(item, spinner);
-            groupPanel.add(spinner, gbc);
+        switch (item.type) {
+            case NUMBER -> {
+                long current = parseClamped(item, configManager.getString(item.key, item.defaultValue));
+                // 注意：四个 long 实参命中 SpinnerNumberModel(double,...) 重载（宽化优先于装箱），
+                // 模型值为 Double，取值时必须按 Number.longValue() 转换（见 save()），
+                // 不能直接 toString 后 Long.parseLong（"5.0" 会解析失败）
+                SpinnerNumberModel model = new SpinnerNumberModel(
+                        current, item.min, item.max, item.step);
+                JSpinner spinner = new JSpinner(model);
+                // 整数显示，带千分位分隔符，大数字更易读
+                JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "#,###");
+                spinner.setEditor(editor);
+                editor.getTextField().setColumns(8);
+                spinner.setToolTipText(String.format("允许范围：%s ~ %s，默认值：%s",
+                        fmt(item.min), fmt(item.max), fmt(item.getDefaultAsLong())));
+                spinners.put(item, spinner);
+                groupPanel.add(spinner, gbc);
 
-            // 范围提示列（靠右，不设固定宽度，用文本自然宽度避免被截断）
-            gbc.gridx = 2;
-            gbc.weightx = 1;
-            gbc.anchor = GridBagConstraints.EAST;
-            gbc.fill = GridBagConstraints.NONE;
-            JLabel range = new JLabel(fmt(item.min) + " ~ " + fmt(item.max));
-            range.setForeground(UIManager.getColor("Label.disabledForeground"));
-            groupPanel.add(range, gbc);
-            // 恢复默认锚点
-            gbc.anchor = GridBagConstraints.WEST;
-        } else if (item.type == ConfigType.BOOL) {
-            JCheckBox checkBox = new JCheckBox("启用");
-            checkBox.setSelected(configManager.getBoolean(item.key,
-                    Boolean.parseBoolean(item.defaultValue)));
-            pluginEnabledBox = checkBox;
-            groupPanel.add(checkBox, gbc);
-        } else {
-            JTextField textField = new JTextField(
-                    configManager.getString(item.key, item.defaultValue), 14);
-            pluginDirField = textField;
-            groupPanel.add(textField, gbc);
+                // 范围提示列（靠右，不设固定宽度，用文本自然宽度避免被截断）
+                gbc.gridx = 2;
+                gbc.weightx = 1;
+                gbc.anchor = GridBagConstraints.EAST;
+                gbc.fill = GridBagConstraints.NONE;
+                JLabel range = styleHint(new JLabel(fmt(item.min) + " ~ " + fmt(item.max)));
+                groupPanel.add(range, gbc);
+                // 恢复默认锚点
+                gbc.anchor = GridBagConstraints.WEST;
+            }
+            case BOOL -> {
+                JCheckBox checkBox = new JCheckBox("启用",
+                        configManager.getBoolean(item.key, Boolean.parseBoolean(item.defaultValue)));
+                checkBox.setFocusable(false);
+                checkBox.setToolTipText("默认值：" + item.defaultValue);
+                checkBoxes.put(item, checkBox);
+                groupPanel.add(checkBox, gbc);
+            }
+            case STRING -> {
+                JTextField textField = new JTextField(
+                        configManager.getString(item.key, item.defaultValue), item.directory ? 16 : 14);
+                textField.setToolTipText("默认值：" + (item.defaultValue.isEmpty() ? "（空）" : item.defaultValue));
+                textFields.put(item, textField);
+                if (item.directory) {
+                    // 目录路径型：输入框 + 浏览按钮组合，点击弹出系统目录选择器
+                    JPanel pathPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+                    pathPanel.add(textField);
+                    JButton browseBtn = new JButton("浏览…", UiIcons.folder());
+                    browseBtn.setFocusable(false);
+                    browseBtn.setToolTipText("浏览并选择目录");
+                    browseBtn.addActionListener(e -> chooseDirectory(textField));
+                    pathPanel.add(browseBtn);
+                    groupPanel.add(pathPanel, gbc);
+                } else {
+                    groupPanel.add(textField, gbc);
+                }
+            }
         }
     }
 
@@ -226,8 +273,7 @@ public class ConfigDialog extends JDialog {
         // 操作说明列
         gbc.gridx = 2;
         gbc.weightx = 1;
-        JLabel hint = new JLabel("打开目录，放入插件 JAR");
-        hint.setForeground(UIManager.getColor("Label.disabledForeground"));
+        JLabel hint = styleHint(new JLabel("打开目录，放入插件 JAR"));
         groupPanel.add(hint, gbc);
     }
 
@@ -236,10 +282,7 @@ public class ConfigDialog extends JDialog {
      * 目录不存在时自动创建；通过系统文件管理器打开，失败时提示手动访问路径。
      */
     private void openPluginDirectory() {
-        String dirText = pluginDirField != null ? pluginDirField.getText().trim() : "";
-        if (dirText.isEmpty()) {
-            dirText = configManager.getString("plugin.dir", "plugins");
-        }
+        String dirText = pluginText("plugin.dir", "plugins");
         File dir = new File(dirText);
         if (!dir.exists() && !dir.mkdirs()) {
             JOptionPane.showMessageDialog(this,
@@ -260,6 +303,37 @@ public class ConfigDialog extends JDialog {
         }
     }
 
+    /**
+     * 弹出系统目录选择器，选择后将绝对路径回填到指定输入框。
+     * 初始目录优先使用输入框当前值（须为已存在目录），否则回退用户主目录。
+     */
+    private void chooseDirectory(JTextField target) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择默认保存路径");
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setAcceptAllFileFilterUsed(false);
+        File current = new File(target.getText().trim());
+        if (current.isDirectory()) {
+            chooser.setCurrentDirectory(current);
+        } else {
+            chooser.setCurrentDirectory(new File(System.getProperty("user.home")));
+        }
+        if (chooser.showDialog(this, "选择") == JFileChooser.APPROVE_OPTION) {
+            target.setText(chooser.getSelectedFile().getAbsolutePath());
+        }
+    }
+
+    /** 取文本配置项的界面当前值（界面未找到时回退配置值/默认值） */
+    private String pluginText(String key, String fallback) {
+        for (Map.Entry<ConfigItem, JTextField> entry : textFields.entrySet()) {
+            if (entry.getKey().key.equals(key)) {
+                String text = entry.getValue().getText().trim();
+                return text.isEmpty() ? fallback : text;
+            }
+        }
+        return configManager.getString(key, fallback);
+    }
+
     /** 数值格式化：带千分位分隔符，提升大数字可读性 */
     private static String fmt(long v) {
         return String.format("%,d", v);
@@ -269,6 +343,8 @@ public class ConfigDialog extends JDialog {
     private int nextRow(JPanel panel) {
         return rowCounters.merge(panel, 1, Integer::sum) - 1;
     }
+
+    private final Map<JPanel, Integer> rowCounters = new HashMap<>();
 
     /**
      * "恢复默认"确认：点"否"或关闭弹窗则取消，不做任何改动；
@@ -295,11 +371,11 @@ public class ConfigDialog extends JDialog {
             // 模型为 Double 类型（见 addItemRow），传 Long 会与边界比较时 ClassCastException
             entry.getValue().setValue((double) entry.getKey().getDefaultAsLong());
         }
-        if (pluginEnabledBox != null) {
-            pluginEnabledBox.setSelected(true);
+        for (Map.Entry<ConfigItem, JCheckBox> entry : checkBoxes.entrySet()) {
+            entry.getValue().setSelected(Boolean.parseBoolean(entry.getKey().defaultValue));
         }
-        if (pluginDirField != null) {
-            pluginDirField.setText("plugins");
+        for (Map.Entry<ConfigItem, JTextField> entry : textFields.entrySet()) {
+            entry.getValue().setText(entry.getKey().defaultValue);
         }
     }
 
@@ -317,25 +393,31 @@ public class ConfigDialog extends JDialog {
 
         Map<String, String> values = new HashMap<>();
         for (ConfigItem item : configManager.getConfigItems()) {
-            if (item.type == ConfigType.NUMBER) {
-                // 以 Number 通用取值，兼容编辑器可能返回的 Long/Integer/Double
-                Number n = (Number) spinners.get(item).getValue();
-                values.put(item.key, Long.toString(n.longValue()));
+            switch (item.type) {
+                case NUMBER -> {
+                    // 以 Number 通用取值，兼容编辑器可能返回的 Long/Integer/Double
+                    Number n = (Number) spinners.get(item).getValue();
+                    values.put(item.key, Long.toString(n.longValue()));
+                }
+                case BOOL -> {
+                    JCheckBox box = checkBoxes.get(item);
+                    values.put(item.key, Boolean.toString(box.isSelected()));
+                }
+                case STRING -> {
+                    String text = textFields.get(item).getText().trim();
+                    if (text.isEmpty()) {
+                        text = item.defaultValue;
+                    }
+                    values.put(item.key, text);
+                }
             }
-        }
-        if (pluginEnabledBox != null) {
-            values.put("plugin.enabled", Boolean.toString(pluginEnabledBox.isSelected()));
-        }
-        if (pluginDirField != null) {
-            String dir = pluginDirField.getText().trim();
-            if (dir.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "插件目录不能为空。", "输入无效",
-                        JOptionPane.WARNING_MESSAGE);
-                return;
-            }
-            values.put("plugin.dir", dir);
         }
 
+        if (values.get("plugin.dir").isEmpty()) {
+            JOptionPane.showMessageDialog(this, "插件目录不能为空。", "输入无效",
+                    JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         // 交叉校验：线程池要求并发任务数不超过最大线程数
         long concurrent = Long.parseLong(values.get("download.maxConcurrentTasks"));
         long maxThreads = Long.parseLong(values.get("download.maxThreads"));

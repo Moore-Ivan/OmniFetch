@@ -1,5 +1,6 @@
 package com.downloader.plugin;
 
+import com.downloader.config.ConfigManager;
 import com.downloader.protocol.DownloadProtocol;
 
 import java.io.File;
@@ -58,21 +59,36 @@ public class PluginManager {
      * 从plugins目录加载插件
      */
     private void loadPluginsFromDirectory() {
-        File pluginsDir = new File("plugins");
+        // 插件目录走配置（plugin.dir），与配置界面展示一致
+        File pluginsDir = new File(ConfigManager.getInstance().getString("plugin.dir", "plugins"));
         if (pluginsDir.exists() && pluginsDir.isDirectory()) {
             File[] jars = pluginsDir.listFiles((dir, name) -> name.endsWith(".jar"));
             if (jars != null) {
                 for (File jar : jars) {
+                    URLClassLoader classLoader = null;
                     try {
-                        URLClassLoader classLoader = new URLClassLoader(new URL[]{jar.toURI().toURL()});
+                        classLoader = new URLClassLoader(new URL[]{jar.toURI().toURL()});
                         ServiceLoader<ProtocolPlugin> loader = ServiceLoader.load(ProtocolPlugin.class, classLoader);
+                        boolean found = false;
                         for (ProtocolPlugin plugin : loader) {
                             plugins.add(plugin);
                             classLoaders.add(classLoader);
+                            found = true;
                             System.out.println("加载插件: " + plugin.getName() + " (支持协议: " + plugin.getProtocolName() + ")");
+                        }
+                        if (!found) {
+                            // jar 中没有插件实现，及时释放 classLoader
+                            classLoader.close();
                         }
                     } catch (Exception e) {
                         System.err.println("加载插件失败: " + jar.getName() + ", 错误: " + e.getMessage());
+                        // 加载失败的 jar 关闭 classLoader，避免资源泄漏
+                        if (classLoader != null) {
+                            try {
+                                classLoader.close();
+                            } catch (Exception ignored) {
+                            }
+                        }
                     }
                 }
             }
@@ -107,6 +123,10 @@ public class PluginManager {
      */
     public DownloadProtocol createDownloader(String url, String savePath, String username, String password,
                                            Object callback, long downloadedSize, String saveFilePath) throws Exception {
+        // 插件功能开关走配置（plugin.enabled），关闭时不走插件下载
+        if (!ConfigManager.getInstance().getBoolean("plugin.enabled", true)) {
+            return null;
+        }
         ProtocolPlugin plugin = getPluginForUrl(url);
         if (plugin != null) {
             return plugin.createDownloader(url, savePath, username, password, 

@@ -55,6 +55,14 @@ public class BitTorrentDownloader implements DownloadProtocol {
         } else {
             meta = parseTorrentFile(source);
         }
+
+        // 磁力链接无法直接获得 piece 哈希（需要 BEP-9 元数据交换，尚未实现），
+        // 若继续执行会出现 0 字节"假完成"，必须显式报错
+        if (meta.infoHash == null || meta.pieceHashes.isEmpty()) {
+            throw new IOException(
+                    "无法获取种子元数据（磁力链接需要 BEP-9 元数据交换支持），请改用 .torrent 文件");
+        }
+
         callback.onConnected(meta.name, meta.totalLength);
 
         // 2. 查询 Tracker
@@ -106,10 +114,12 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
                             if (data != null && verifyPiece(
                                     data, meta.pieceHashes.get(i))) {
-                                long position = (long) i * PIECE_LENGTH;
+                                // 写入位置必须按种子声明的 piece length 计算，
+                                // 硬编码值会导致文件内容错位损坏
+                                long position = (long) i * meta.pieceLength;
                                 // 使用分段内存映射
                                 writePieceToFile(channel, position, data);
-                                
+
                                 synchronized (pieceDone) {
                                     pieceDone[i] = true;
                                 }
@@ -140,6 +150,21 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
             executor.shutdown();
             executor.awaitTermination(30, TimeUnit.MINUTES);
+
+            // 完整性校验：只有全部 piece 都校验通过才允许报告完成，
+            // 避免 Peer 全部失败/校验不通过时产生 0 字节"假完成"
+            if (!cancelled) {
+                int doneCount = 0;
+                synchronized (pieceDone) {
+                    for (boolean b : pieceDone) {
+                        if (b) doneCount++;
+                    }
+                }
+                if (doneCount < pieceCount) {
+                    throw new IOException(
+                            "下载不完整（" + doneCount + "/" + pieceCount + " 个分块），请稍后重试");
+                }
+            }
 
         } finally {
             // 关闭资源

@@ -1,30 +1,38 @@
 package com.downloader.gui;
 
+import com.downloader.Main;
+import com.downloader.config.ConfigManager;
 import com.downloader.detector.ProtocolDetector;
+import com.downloader.event.DownloadEvent;
+import com.downloader.event.EventBus;
 import com.downloader.manager.DownloadManager;
 import com.downloader.model.DownloadTask;
 import com.downloader.model.Protocol;
 import com.downloader.util.AppPrefs;
 import com.downloader.util.FileUtils;
+import com.downloader.util.InstallerLauncher;
+import com.downloader.util.OsTheme;
 import com.downloader.util.UpdateChecker;
 import com.downloader.util.VersionInfo;
-import com.formdev.flatlaf.FlatDarkLaf;
-import com.formdev.flatlaf.FlatLightLaf;
 
 import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
+import javax.swing.ButtonGroup;
 import javax.swing.Icon;
 import javax.swing.JButton;
 import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
+import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
+import javax.swing.JPopupMenu;
 import javax.swing.JProgressBar;
+import javax.swing.JRadioButtonMenuItem;
 import javax.swing.JScrollPane;
 import javax.swing.JSeparator;
 import javax.swing.JTable;
@@ -34,7 +42,6 @@ import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.UIManager;
-import javax.swing.UnsupportedLookAndFeelException;
 import javax.swing.border.TitledBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
@@ -58,6 +65,10 @@ import java.awt.Graphics2D;
 import java.awt.GridBagLayout;
 import java.awt.Image;
 import java.awt.RenderingHints;
+import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.ByteArrayInputStream;
@@ -128,9 +139,16 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     // --- 状态 ---
     private final DownloadManager downloadManager;
-    private boolean darkMode = AppPrefs.isDarkMode();
+    /** 主题模式（浅色 / 深色 / 跟随系统），持久化于 AppPrefs */
+    private AppPrefs.ThemeMode themeMode = AppPrefs.getThemeMode();
+    /** 当前生效的深浅色（SYSTEM 模式下随操作系统切换而变化） */
+    private boolean darkMode = Main.resolveDark(themeMode);
     private boolean credsShown = false;
     private Protocol detectedProtocol;
+    /** 主界面保存路径是否被用户手动修改过（未修改时跟随配置中的"默认保存路径"自动同步） */
+    private boolean pathFieldEdited = false;
+    /** 程序化同步路径输入框时抑制"用户已编辑"标记（区分用户输入与代码 setText） */
+    private boolean syncingPath = false;
     /** 前景色需跟随主题的次要标签（自定义前景色不会被 updateComponentTreeUI 自动替换） */
     private final List<JLabel> hintLabels = new ArrayList<>();
     /** 进度条渲染器不在组件树中，换肤后需手动刷新其内部组件 */
@@ -151,6 +169,163 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         }
         initUI();
         initWindowListener();
+        syncThemeWatcher();
+        registerDownloadEventNotifications();
+        registerConfigSync();
+    }
+
+    /**
+     * 订阅下载事件：任务完成 / 失败时弹 Toast 提示；
+     * 开启「完成后自动打开目录」配置时定位到已保存的文件。
+     */
+    private void registerDownloadEventNotifications() {
+        EventBus.getInstance().register(event -> {
+            switch (event.getType()) {
+                case TASK_COMPLETED -> {
+                    DownloadTask task = event.getTask();
+                    EventQueue.invokeLater(() -> {
+                        Toast.success(this, "下载完成：" + safeFileName(task));
+                        if (ConfigManager.getInstance()
+                                .getBoolean("download.autoOpenFolder", false)) {
+                            revealInFileManager(task);
+                        }
+                    });
+                }
+                case TASK_FAILED -> {
+                    DownloadTask task = event.getTask();
+                    EventQueue.invokeLater(() -> Toast.error(this,
+                            "下载失败：" + safeFileName(task)));
+                }
+                default -> { }
+            }
+        });
+    }
+
+    /** 文件名兜底（任务失败时可能尚未连接成功） */
+    private static String safeFileName(DownloadTask task) {
+        String name = task.getFileName();
+        return (name == null || name.isBlank()) ? "任务 " + task.getId() : name;
+    }
+
+    /**
+     * 订阅配置变更：高级配置中保存"默认保存路径"（或外部编辑配置文件）后，
+     * 若用户未在主界面手动改过保存路径，则即时同步显示，
+     * 避免"配置已保存但主界面仍是旧路径"；用户手动改过则保留其选择不被覆盖。
+     * 事件可能来自配置文件监视器线程，统一切回 EDT 更新组件。
+     */
+    private void registerConfigSync() {
+        EventBus.getInstance().registerConfigChangeListener(event ->
+                EventQueue.invokeLater(() -> {
+                    if (pathField == null || pathFieldEdited) {
+                        return;
+                    }
+                    syncingPath = true;
+                    try {
+                        pathField.setText(resolveDefaultSaveDir());
+                    } finally {
+                        syncingPath = false;
+                    }
+                }));
+    }
+
+    /** 在系统文件管理器中定位文件（Windows 用 explorer /select 选中文件，其他平台打开所在目录） */
+    private void revealInFileManager(DownloadTask task) {
+        String path = task.getSaveFilePath();
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        Thread.ofVirtual().start(() -> {
+            try {
+                File file = new File(path);
+                if (System.getProperty("os.name", "").toLowerCase().contains("windows")) {
+                    new ProcessBuilder("explorer", "/select," + file.getAbsolutePath()).start();
+                } else {
+                    File dir = file.getParentFile();
+                    if (dir != null && dir.exists()) {
+                        Desktop.getDesktop().open(dir);
+                    }
+                }
+            } catch (Exception e) {
+                // 自动打开属于增强体验，失败不打扰用户
+            }
+        });
+    }
+
+    /**
+     * "打开"按钮：在系统文件管理器中打开主界面当前保存路径目录。
+     * 路径为空时提示；路径是普通文件时警告；目录不存在时询问是否创建后打开。
+     */
+    private void openPathDirectory() {
+        String text = pathField.getText().trim();
+        if (text.isEmpty()) {
+            pathField.putClientProperty("JComponent.outline", "error");
+            Toast.warning(this, "保存路径为空");
+            return;
+        }
+        File dir = new File(text);
+        if (dir.exists() && !dir.isDirectory()) {
+            JOptionPane.showMessageDialog(this,
+                    "保存路径不是一个目录：\n" + dir.getAbsolutePath(),
+                    "无法打开", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (!dir.exists()) {
+            int choice = JOptionPane.showConfirmDialog(this,
+                    "目录不存在，是否创建并打开？\n" + dir.getAbsolutePath(),
+                    "目录不存在", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (choice != JOptionPane.YES_OPTION) {
+                return;
+            }
+            if (!dir.mkdirs()) {
+                JOptionPane.showMessageDialog(this,
+                        "无法创建目录：\n" + dir.getAbsolutePath(),
+                        "创建失败", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+        }
+        File target = dir;
+        Thread.ofVirtual().start(() -> {
+            String error = openSystemDirectory(target);
+            if (error != null) {
+                EventQueue.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                        "无法自动打开目录，请手动访问：\n" + target.getAbsolutePath()
+                                + "\n\n原因：" + error,
+                        "打开失败", JOptionPane.WARNING_MESSAGE));
+            }
+        });
+    }
+
+    /**
+     * 跨平台打开目录，多级回退（Desktop.open → 系统命令）。
+     * @return 成功返回 null；全部失败返回首个错误信息
+     */
+    private static String openSystemDirectory(File dir) {
+        Exception firstError = null;
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(dir);
+                return null;
+            }
+            firstError = new UnsupportedOperationException("当前平台不支持桌面打开操作");
+        } catch (Exception e) {
+            firstError = e;
+        }
+        try {
+            String os = System.getProperty("os.name", "").toLowerCase();
+            ProcessBuilder pb;
+            if (os.contains("win")) {
+                pb = new ProcessBuilder("cmd", "/c", "start", "", dir.getAbsolutePath());
+            } else if (os.contains("mac")) {
+                pb = new ProcessBuilder("open", dir.getAbsolutePath());
+            } else {
+                pb = new ProcessBuilder("xdg-open", dir.getAbsolutePath());
+            }
+            if (pb.start().waitFor() == 0) {
+                return null;
+            }
+        } catch (Exception ignored) {
+        }
+        return firstError != null ? firstError.getMessage() : "未知错误";
     }
 
     /**
@@ -188,7 +363,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     private void initUI() {
         setTitle("万象抓取" + VersionInfo.getDisplayVersion());
-        setSize(960, 650);
+        setSize(940, 650);
         // 关键：禁用 JFrame 默认关闭行为，由 windowClosing 手动处理，
         // 点击取消时窗口不关闭
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -232,9 +407,9 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         onTextChange(searchField, this::applySearch);
         rightTools.add(searchField);
 
-        themeBtn = toolButton(darkMode ? "浅色主题" : "深色主题",
-                darkMode ? UiIcons.sun() : UiIcons.moon());
-        themeBtn.addActionListener(e -> toggleTheme());
+        themeBtn = toolButton(themeModeLabel(), themeModeIcon());
+        themeBtn.setToolTipText("切换主题模式：浅色 / 深色 / 跟随系统");
+        themeBtn.addActionListener(e -> showThemeMenu());
         rightTools.add(themeBtn);
 
         JButton configBtn = toolButton("高级配置", UiIcons.settings());
@@ -311,6 +486,29 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         rowSorter = new TableRowSorter<>(taskModel);
         rowSorter.setSortsOnUpdates(false); // 增量更新时不重排序，避免视觉跳动
         taskTable.setRowSorter(rowSorter);
+
+        // 右键菜单（打开 / 复制链接 / 暂停继续 / 删除）+ 双击定位文件
+        taskTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                showTaskContextMenuIfNeeded(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                showTaskContextMenuIfNeeded(e);
+            }
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    DownloadTask task = taskAt(e);
+                    if (task != null) {
+                        revealInFileManager(task);
+                    }
+                }
+            }
+        });
 
         JScrollPane scrollPane = new JScrollPane(taskTable);
         scrollPane.getVerticalScrollBar().setUnitIncrement(16);
@@ -424,6 +622,21 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         });
     }
 
+    /**
+     * 解析配置中的"默认保存路径"为绝对路径：
+     * 空值（旧配置升级）兜底为程序根目录/downloads；相对路径按程序根目录解析。
+     */
+    private static String resolveDefaultSaveDir() {
+        String dir = ConfigManager.getInstance()
+                .getString("download.defaultSaveDir", "").trim();
+        if (dir.isEmpty()) {
+            dir = "downloads";
+        }
+        File f = new File(dir);
+        return f.isAbsolute() ? f.getAbsolutePath()
+                : new File(System.getProperty("user.dir"), dir).getAbsolutePath();
+    }
+
     private JLabel createHintLabel(String text) {
         JLabel label = new JLabel(text);
         label.setForeground(hintForeground());
@@ -453,12 +666,20 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
         JLabel l = createHintLabel("保存路径");
 
+        // 输入框占满剩余宽度（CENTER），右侧仅固定空出"浏览…/打开"按钮的位置
         JPanel row = new JPanel(new BorderLayout(8, 0));
 
-        pathField = new JTextField(System.getProperty("user.dir"));
-        onTextChange(pathField, () -> pathField.putClientProperty("JComponent.outline", null));
+        // 初始值：取配置的"默认保存路径"（空值/旧配置兜底为程序根目录下 downloads，
+        // 相对路径按程序根目录解析为绝对路径，所见即所得）；目录在首次下载时自动创建
+        pathField = new JTextField(resolveDefaultSaveDir());
+        onTextChange(pathField, () -> {
+            if (!syncingPath) {
+                pathFieldEdited = true;
+            }
+            pathField.putClientProperty("JComponent.outline", null);
+        });
 
-        browseBtn = new JButton("浏览...", UiIcons.folder());
+        browseBtn = new JButton("浏览…", UiIcons.folder());
         browseBtn.setFocusable(false);
         browseBtn.setPreferredSize(new Dimension(96, browseBtn.getPreferredSize().height));
         browseBtn.addActionListener(e -> {
@@ -471,8 +692,19 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             }
         });
 
+        // "打开"：在系统文件管理器中打开当前保存路径对应的目录
+        JButton openBtn = new JButton("打开");
+        openBtn.setFocusable(false);
+        openBtn.setPreferredSize(new Dimension(96, openBtn.getPreferredSize().height));
+        openBtn.setToolTipText("在系统文件管理器中打开保存目录");
+        openBtn.addActionListener(e -> openPathDirectory());
+
+        JPanel btnGroup = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        btnGroup.add(browseBtn);
+        btnGroup.add(openBtn);
+
         row.add(pathField, BorderLayout.CENTER);
-        row.add(browseBtn, BorderLayout.EAST);
+        row.add(btnGroup, BorderLayout.EAST);
 
         panel.add(l);
         panel.add(strut(5));
@@ -571,22 +803,66 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     // ══════════════════════════════════════════
-    //  主题切换
+    //  主题切换（浅色 / 深色 / 跟随系统）
     // ══════════════════════════════════════════
 
-    private void toggleTheme() {
-        darkMode = !darkMode;
-        try {
-            UIManager.setLookAndFeel(darkMode ? new FlatDarkLaf() : new FlatLightLaf());
-        } catch (UnsupportedLookAndFeelException e) {
-            // 回滚状态并中止切换
-            darkMode = !darkMode;
-            System.err.println("切换主题失败: " + e.getMessage());
+    private String themeModeLabel() {
+        return switch (themeMode) {
+            case LIGHT -> "浅色模式";
+            case DARK -> "深色模式";
+            case SYSTEM -> "跟随系统";
+        };
+    }
+
+    private Icon themeModeIcon() {
+        return switch (themeMode) {
+            case LIGHT -> UiIcons.sun();
+            case DARK -> UiIcons.moon();
+            case SYSTEM -> UiIcons.themeAuto();
+        };
+    }
+
+    /** 弹出三选一主题菜单（单选），选择后立即切换并持久化 */
+    private void showThemeMenu() {
+        JPopupMenu menu = new JPopupMenu();
+        ButtonGroup group = new ButtonGroup();
+        for (AppPrefs.ThemeMode mode : AppPrefs.ThemeMode.values()) {
+            JRadioButtonMenuItem item = new JRadioButtonMenuItem(
+                    switch (mode) {
+                        case LIGHT -> "浅色模式";
+                        case DARK -> "深色模式";
+                        case SYSTEM -> "跟随系统（自动切换）";
+                    },
+                    mode == themeMode);
+            item.addActionListener(e -> setThemeMode(mode));
+            group.add(item);
+            menu.add(item);
+        }
+        menu.show(themeBtn, 0, themeBtn.getHeight());
+    }
+
+    /** 切换主题模式：换肤 + 持久化 + 同步系统主题监听 */
+    private void setThemeMode(AppPrefs.ThemeMode mode) {
+        if (mode == themeMode) {
             return;
         }
+        themeMode = mode;
+        applyTheme(Main.resolveDark(mode));
+        AppPrefs.setThemeMode(mode);
+        syncThemeWatcher();
+    }
 
-        // 刷新窗口内所有已创建组件的 UI 委托
-        SwingUtilities.updateComponentTreeUI(this);
+    /** 全局换肤：覆盖所有已创建窗口（主窗口 / 配置 / 更新对话框等） */
+    private void applyTheme(boolean dark) {
+        darkMode = dark;
+        Main.applyLaf(dark);
+
+        // 刷新全部窗口的 UI 委托（含不可见的后台对话框）
+        for (java.awt.Window w : java.awt.Window.getWindows()) {
+            if (w.isDisplayable()) {
+                SwingUtilities.updateComponentTreeUI(w);
+            }
+        }
         // 单元格渲染器不在组件树中，需单独刷新其内部组件
         if (progressRenderer != null) {
             SwingUtilities.updateComponentTreeUI(progressRenderer.content);
@@ -595,13 +871,36 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         hintLabels.forEach(l -> l.setForeground(hintForeground()));
         // TitledBorder 标题色在创建时快照，需重建
         applyFormBorder();
+        // 配置对话框的卡片边框/标题色同样是快照，需刷新
+        for (java.awt.Window w : java.awt.Window.getWindows()) {
+            if (w instanceof ConfigDialog dialog) {
+                dialog.refreshTheme();
+            }
+        }
 
-        themeBtn.setText(darkMode ? "浅色主题" : "深色主题");
-        themeBtn.setIcon(darkMode ? UiIcons.sun() : UiIcons.moon());
+        themeBtn.setText(themeModeLabel());
+        themeBtn.setIcon(themeModeIcon());
         taskTable.repaint();
+    }
 
-        // 持久化用户的主题选择，下次启动按此设置 L&F
-        AppPrefs.setDarkMode(darkMode);
+    /** 「跟随系统」模式下监听操作系统深浅色切换；手动模式下停止监听 */
+    private void syncThemeWatcher() {
+        if (themeMode == AppPrefs.ThemeMode.SYSTEM) {
+            OsTheme.startWatching(this::onOsThemeChanged);
+        } else {
+            OsTheme.stopWatching();
+        }
+    }
+
+    /** 操作系统深浅色变化回调（已在 EDT 上） */
+    private void onOsThemeChanged() {
+        if (themeMode != AppPrefs.ThemeMode.SYSTEM) {
+            return;
+        }
+        boolean osDark = OsTheme.isOsDark();
+        if (osDark != darkMode) {
+            applyTheme(osDark);
+        }
     }
 
     // ══════════════════════════════════════════
@@ -762,6 +1061,106 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             }
         }
         return selectedIds;
+    }
+
+    // ── 任务行右键菜单与快捷定位 ──
+
+    /** 取鼠标事件所在行的任务（自动处理视图行到模型行的换算） */
+    private DownloadTask taskAt(MouseEvent e) {
+        int viewRow = taskTable.rowAtPoint(e.getPoint());
+        if (viewRow < 0) {
+            return null;
+        }
+        int modelRow = taskTable.convertRowIndexToModel(viewRow);
+        if (modelRow < 0) {
+            return null;
+        }
+        Object id = taskModel.getValueAt(modelRow, 1);
+        return (id instanceof String taskId) ? downloadManager.getTask(taskId) : null;
+    }
+
+    private void showTaskContextMenuIfNeeded(MouseEvent e) {
+        if (!e.isPopupTrigger()) {
+            return;
+        }
+        DownloadTask task = taskAt(e);
+        if (task == null) {
+            return;
+        }
+        // 右键未选中的行时，先选中该行，保证菜单操作针对该任务
+        int viewRow = taskTable.rowAtPoint(e.getPoint());
+        if (taskTable.getSelectedRowCount() <= 1) {
+            taskTable.setRowSelectionInterval(viewRow, viewRow);
+        }
+        buildTaskContextMenu(task).show(taskTable, e.getX(), e.getY());
+    }
+
+    /** 按任务当前状态构建右键菜单 */
+    private JPopupMenu buildTaskContextMenu(DownloadTask task) {
+        JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem openItem = new JMenuItem("打开文件", UiIcons.check());
+        openItem.setEnabled(task.getStatus() == DownloadTask.TaskStatus.COMPLETED
+                && task.getSaveFilePath() != null
+                && new File(task.getSaveFilePath()).isFile());
+        openItem.addActionListener(e -> openTaskFile(task));
+        menu.add(openItem);
+
+        JMenuItem revealItem = new JMenuItem("打开所在文件夹", UiIcons.folder());
+        revealItem.setEnabled(task.getSaveFilePath() != null);
+        revealItem.addActionListener(e -> revealInFileManager(task));
+        menu.add(revealItem);
+
+        JMenuItem copyItem = new JMenuItem("复制下载链接", UiIcons.contact());
+        copyItem.addActionListener(e -> copyText(task.getUrl(), "下载链接已复制"));
+        menu.add(copyItem);
+
+        menu.addSeparator();
+        switch (task.getStatus()) {
+            case DOWNLOADING, WAITING -> {
+                JMenuItem pauseItem = new JMenuItem("暂停", UiIcons.pause());
+                pauseItem.addActionListener(e -> downloadManager.pauseTask(task.getId()));
+                menu.add(pauseItem);
+            }
+            case PAUSED -> {
+                JMenuItem resumeItem = new JMenuItem("继续", UiIcons.resume());
+                resumeItem.addActionListener(e -> downloadManager.resumeTask(task.getId()));
+                menu.add(resumeItem);
+            }
+            default -> { }
+        }
+
+        JMenuItem deleteItem = new JMenuItem("删除任务", UiIcons.delete());
+        deleteItem.addActionListener(e -> downloadManager.removeTask(task.getId()));
+        menu.add(deleteItem);
+        return menu;
+    }
+
+    /** 打开已完成的文件（复用 InstallerLauncher 的多级回退，exe 也可正常启动） */
+    private void openTaskFile(DownloadTask task) {
+        String path = task.getSaveFilePath();
+        if (path == null) {
+            return;
+        }
+        File file = new File(path);
+        if (!file.isFile()) {
+            Toast.warning(this, "文件不存在或已被移动");
+            return;
+        }
+        Thread.ofVirtual().start(() -> {
+            String error = InstallerLauncher.launch(file);
+            if (error != null) {
+                EventQueue.invokeLater(() -> Toast.warning(this,
+                        "无法打开文件：" + error));
+            }
+        });
+    }
+
+    /** 复制文本到系统剪贴板并提示 */
+    private void copyText(String text, String successMsg) {
+        Toolkit.getDefaultToolkit().getSystemClipboard()
+                .setContents(new StringSelection(text), null);
+        Toast.info(this, successMsg);
     }
 
     // ══════════════════════════════════════════

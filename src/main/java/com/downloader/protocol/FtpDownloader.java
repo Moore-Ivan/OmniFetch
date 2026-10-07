@@ -1,5 +1,6 @@
 package com.downloader.protocol;
 
+import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
 import com.downloader.pool.FtpConnectionPool;
 import com.downloader.util.FileUtils;
@@ -22,6 +23,14 @@ public class FtpDownloader implements DownloadProtocol {
     private FtpConnectionPool.FtpConnection connection;
 
     private static final int BUFFER_SIZE = 16_384;
+    /** 数据连接读超时：持续 30 秒无任何数据判定连接死亡，抛错触发重试 */
+    private static final int READ_TIMEOUT_MS = 30_000;
+
+    private final ConfigManager configManager = ConfigManager.getInstance();
+
+    private int getProgressIntervalMs() {
+        return configManager.getInt("download.progressIntervalMs", 200);
+    }
 
     public FtpDownloader(String host, int port, String user, String pass,
                          String remotePath, String savePath,
@@ -60,6 +69,8 @@ public class FtpDownloader implements DownloadProtocol {
             Socket dataSocket = new Socket();
             dataSocket.connect(
                     new InetSocketAddress(dataIp, dataPort), 10000);
+            // 读超时防止服务器假死导致任务永久卡在"下载中"
+            dataSocket.setSoTimeout(READ_TIMEOUT_MS);
 
             String fileName = remotePath.contains("/")
                     ? remotePath.substring(remotePath.lastIndexOf('/') + 1)
@@ -70,7 +81,7 @@ public class FtpDownloader implements DownloadProtocol {
             callback.onStatusUpdate("FTP 被动模式");
 
             File saveFile = FileUtils.buildSaveFile(savePath, fileName);
-            
+
             // 预分配磁盘空间，避免文件系统碎片
             if (totalSize > 0) {
                 try (RandomAccessFile raf = new RandomAccessFile(saveFile, "rw")) {
@@ -86,6 +97,7 @@ public class FtpDownloader implements DownloadProtocol {
                 long downloaded = 0;
                 long lastTime = System.currentTimeMillis();
                 long lastBytes = 0;
+                int progressInterval = getProgressIntervalMs();
 
                 while ((read = in.read(buf)) != -1) {
                     if (cancelled) {
@@ -99,7 +111,7 @@ public class FtpDownloader implements DownloadProtocol {
                     downloaded += read;
 
                     long now = System.currentTimeMillis();
-                    if (now - lastTime >= 250) {
+                    if (now - lastTime >= progressInterval) {
                         long speed = (long) ((downloaded - lastBytes)
                                 * 1000.0 / (now - lastTime));
                         callback.onProgress(downloaded, totalSize, speed);

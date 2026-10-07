@@ -36,9 +36,11 @@ public class ConfigManager {
         public final long max;
         public final long step;
         public final String defaultValue;
+        /** 是否为目录路径型文本项（界面提供"浏览"按钮选择目录） */
+        public final boolean directory;
 
         private ConfigItem(String group, String key, String label, String unit, ConfigType type,
-                           long min, long max, long step, String defaultValue) {
+                           long min, long max, long step, String defaultValue, boolean directory) {
             this.group = group;
             this.key = key;
             this.label = label;
@@ -48,6 +50,7 @@ public class ConfigManager {
             this.max = max;
             this.step = step;
             this.defaultValue = defaultValue;
+            this.directory = directory;
         }
 
         public long getDefaultAsLong() {
@@ -62,18 +65,23 @@ public class ConfigManager {
     private static ConfigItem number(String group, String key, String label, String unit,
                                      long min, long max, long step, long def) {
         ConfigItem item = new ConfigItem(group, key, label, unit, ConfigType.NUMBER,
-                min, max, step, Long.toString(def));
+                min, max, step, Long.toString(def), false);
         register(item);
         return item;
     }
 
     private static void bool(String group, String key, String label, boolean def) {
         register(new ConfigItem(group, key, label, null, ConfigType.BOOL, 0, 0, 1,
-                Boolean.toString(def)));
+                Boolean.toString(def), false));
     }
 
     private static void text(String group, String key, String label, String def) {
-        register(new ConfigItem(group, key, label, null, ConfigType.STRING, 0, 0, 1, def));
+        register(new ConfigItem(group, key, label, null, ConfigType.STRING, 0, 0, 1, def, false));
+    }
+
+    /** 目录路径型文本项：界面渲染时附带"浏览"按钮 */
+    private static void directory(String group, String key, String label, String def) {
+        register(new ConfigItem(group, key, label, null, ConfigType.STRING, 0, 0, 1, def, true));
     }
 
     private static void register(ConfigItem item) {
@@ -89,10 +97,15 @@ public class ConfigManager {
         number("下载配置", "download.connectTimeoutSec", "连接超时", "秒", 1, 300, 1, 15);
         number("下载配置", "download.progressIntervalMs", "进度更新间隔", "毫秒", 50, 5_000, 50, 200);
         number("下载配置", "download.flushIntervalMs", "磁盘刷新间隔", "毫秒", 1_000, 120_000, 1_000, 10_000);
+        number("下载配置", "download.maxRetryCount", "失败自动重试次数", "次", 0, 10, 1, 3);
+        number("下载配置", "download.m3u8Concurrent", "M3U8分片并发数", "个", 1, 16, 1, 8);
+        bool("下载配置", "download.autoOpenFolder", "完成后自动打开目录", false);
+        directory("下载配置", "download.defaultSaveDir", "默认保存路径", "downloads");
         // HTTP配置
         number("HTTP配置", "http.maxThreads", "HTTP最大线程数", "个", 1, 128, 1, 16);
         number("HTTP配置", "http.minChunkSize", "最小分片大小", "字节", 65_536, 104_857_600, 65_536, 5_242_880);
         number("HTTP配置", "http.maxChunkSize", "最大分片大小", "字节", 1_048_576, 536_870_912, 1_048_576, 52_428_800);
+        text("HTTP配置", "http.userAgent", "User-Agent", "Mozilla/5.0 (MultiProtocolDownloader/2.0)");
         // FTP/SFTP配置
         number("FTP/SFTP配置", "ftp.maxConnections", "最大连接数", "个", 1, 50, 1, 10);
         number("FTP/SFTP配置", "ftp.connectionTimeoutSec", "连接超时", "秒", 1, 300, 1, 30);
@@ -212,12 +225,29 @@ public class ConfigManager {
                 sb.append("（").append(item.unit).append('）');
             }
             sb.append(System.lineSeparator());
-            String value = props.getProperty(item.key, item.defaultValue);
-            sb.append(item.key).append('=').append(value).append(System.lineSeparator());
+            // 值必须按 properties 规则转义：反斜杠（Windows 路径分隔符！否则
+            // Properties.load 会把 C:\Users 读成 C:Users）、换行、前导空白
+            sb.append(item.key).append('=')
+              .append(escapePropertyValue(props.getProperty(item.key, item.defaultValue)))
+              .append(System.lineSeparator());
         }
         try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
             writer.write(sb.toString());
         }
+    }
+
+    /**
+     * properties 值转义（键均为固定 ASCII 无需处理）：
+     * 反斜杠 → \\（Windows 路径关键），CR/LF → \r/\n，前导空白加反斜杠防读取时被忽略。
+     */
+    private static String escapePropertyValue(String value) {
+        String escaped = value.replace("\\", "\\\\")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
+        if (!escaped.isEmpty() && Character.isWhitespace(escaped.charAt(0))) {
+            escaped = "\\" + escaped;
+        }
+        return escaped;
     }
 
     /**

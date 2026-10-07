@@ -48,7 +48,6 @@ public class DownloadTask {
     private LocalDateTime completedTime;
     
     private volatile int retryCount = 0;
-    private static final int MAX_RETRY_COUNT = 3;
     
     private DownloadProtocol downloader;
     private ProgressCallback callback;
@@ -217,20 +216,18 @@ public class DownloadTask {
     public int getRetryCount() {
         return retryCount;
     }
-    
+
     public void incrementRetryCount() {
         retryCount++;
     }
-    
+
     public void resetRetryCount() {
         retryCount = 0;
     }
-    
+
+    /** 重试上限取自配置项 download.maxRetryCount（默认 3，读取时自动钳制） */
     public boolean canRetry() {
-        return retryCount < MAX_RETRY_COUNT;
-    }
-    
-    public static int getMaxRetryCount() {
-        return MAX_RETRY_COUNT;
+        return retryCount < com.downloader.config.ConfigManager.getInstance()
+                .getInt("download.maxRetryCount", 3);
     }
 }

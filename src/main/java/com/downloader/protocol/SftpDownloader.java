@@ -1,5 +1,6 @@
 package com.downloader.protocol;
 
+import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
 import com.downloader.pool.SftpConnectionPool;
 import com.downloader.util.FileUtils;
@@ -21,6 +22,12 @@ public class SftpDownloader implements DownloadProtocol {
     private SftpConnectionPool.SftpConnection connection;
 
     private static final int BUFFER_SIZE = 16_384;
+    private static final int READ_TIMEOUT_MS = 30_000;
+
+    /** 进度上报间隔走配置（download.progressIntervalMs） */
+    private int getProgressIntervalMs() {
+        return ConfigManager.getInstance().getInt("download.progressIntervalMs", 250);
+    }
 
     public SftpDownloader(String host, int port, String user, String pass,
                           String remotePath, String savePath,
@@ -37,6 +44,13 @@ public class SftpDownloader implements DownloadProtocol {
             // 从连接池获取连接
             connection = connectionPool.getConnection();
             ChannelSftp channel = connection.getChannel();
+
+            // 读超时防止服务器假死导致任务永久卡在"下载中"
+            try {
+                channel.getSession().setTimeout(READ_TIMEOUT_MS);
+            } catch (JSchException e) {
+                // 会话已连接时设置失败不影响下载，忽略
+            }
 
             // 获取远程文件属性
             SftpATTRS attrs = channel.stat(remotePath);
@@ -71,6 +85,7 @@ public class SftpDownloader implements DownloadProtocol {
                 long downloaded = 0;
                 long lastTime = System.currentTimeMillis();
                 long lastBytes = 0;
+                int progressInterval = getProgressIntervalMs();
 
                 while ((read = in.read(buf)) != -1) {
                     if (cancelled) {
@@ -82,7 +97,7 @@ public class SftpDownloader implements DownloadProtocol {
                     downloaded += read;
 
                     long now = System.currentTimeMillis();
-                    if (now - lastTime >= 250) {
+                    if (now - lastTime >= progressInterval) {
                         long speed = (long) ((downloaded - lastBytes)
                                 * 1000.0 / (now - lastTime));
                         callback.onProgress(downloaded, totalSize, speed);

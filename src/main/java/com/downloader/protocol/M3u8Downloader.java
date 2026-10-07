@@ -1,5 +1,6 @@
 package com.downloader.protocol;
 
+import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
 import com.downloader.util.FileUtils;
 
@@ -29,8 +30,9 @@ public class M3u8Downloader implements DownloadProtocol {
     private final HttpClient httpClient;
     private ExecutorService executor;
 
-    private static final int MAX_CONCURRENT = 8;
     private static final int CONNECT_TIMEOUT_SEC = 10;
+
+    private final ConfigManager configManager = ConfigManager.getInstance();
 
     public M3u8Downloader(String url, String savePath, ProgressCallback cb) {
         this.playlistURL = url;
@@ -74,17 +76,20 @@ public class M3u8Downloader implements DownloadProtocol {
         Path tempDir = Files.createTempDirectory("m3u8_dl_");
 
         try {
-            // 3. 多线程下载分片
-            executor = Executors.newFixedThreadPool(MAX_CONCURRENT);
+            // 3. 多线程下载分片（并发数可配置）
+            int maxConcurrent = configManager.getInt("download.m3u8Concurrent", 8);
+            executor = Executors.newFixedThreadPool(maxConcurrent);
             AtomicInteger completed = new AtomicInteger(0);
             AtomicLong totalDownloaded = new AtomicLong(0);
+            AtomicBoolean failed = new AtomicBoolean(false);
+            AtomicReference<String> firstError = new AtomicReference<>(null);
             long startTime = System.currentTimeMillis();
             AtomicLong lastCheck = new AtomicLong(startTime);
             AtomicLong lastBytes = new AtomicLong(0);
 
             List<Future<?>> futures = new ArrayList<>();
             for (int i = 0; i < total; i++) {
-                if (cancelled) break;
+                if (cancelled || failed.get()) break;
 
                 final int index = i;
                 final Segment seg = segments.get(i);
@@ -92,6 +97,10 @@ public class M3u8Downloader implements DownloadProtocol {
 
                 futures.add(executor.submit(() -> {
                     try {
+                        // 已有分片失败时尽快退出，避免无谓流量
+                        if (failed.get() || cancelled) {
+                            return;
+                        }
                         byte[] data = fetchBytes(segUrl);
 
                         // AES-128 解密
@@ -112,26 +121,33 @@ public class M3u8Downloader implements DownloadProtocol {
                         if (now - lc >= 300 && lastCheck.compareAndSet(lc, now)) {
                             long speed = (long) ((downloaded - lastBytes.get())
                                     * 1000.0 / (now - lc));
-                            callback.onProgress(done, total, speed);
+                            // 进度按实际字节数上报（总大小未知，速度保持真实）
+                            callback.onProgress(downloaded, -1, speed);
                             callback.onStatusUpdate(
                                     String.format("分片 %d/%d", done, total));
                             lastBytes.set(downloaded);
                         }
                     } catch (Exception e) {
-                        if (!cancelled) {
-                            callback.onError("分片 " + index + " 失败: "
-                                    + e.getMessage());
+                        // 快速失败：记录首个错误并终止后续分片，避免"半成品文件仍被标记完成"
+                        if (failed.compareAndSet(false, true)) {
+                            firstError.set("分片 " + index + " 失败: " + e.getMessage());
+                        }
+                        if (executor != null) {
+                            executor.shutdownNow();
                         }
                     }
                 }));
             }
 
-            // 等待所有分片完成
+            // 等待所有分片结束
             for (Future<?> f : futures) {
                 try { f.get(); } catch (Exception ignored) {}
             }
 
             if (cancelled) return;
+            if (failed.get()) {
+                throw new IOException(firstError.get());
+            }
 
             // 4. 按顺序合并分片
             callback.onStatusUpdate("合并分片...");
@@ -156,6 +172,9 @@ public class M3u8Downloader implements DownloadProtocol {
 
         } finally {
             // 5. 清理临时文件
+            if (executor != null) {
+                executor.shutdownNow();
+            }
             FileUtils.deleteDir(tempDir);
         }
     }

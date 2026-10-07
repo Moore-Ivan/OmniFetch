@@ -9,22 +9,51 @@ import java.util.prefs.Preferences;
  */
 public final class AppPrefs {
 
+    /** 主题模式：浅色 / 深色 / 跟随操作系统 */
+    public enum ThemeMode { LIGHT, DARK, SYSTEM }
+
     private static final Preferences PREFS =
             Preferences.userRoot().node("com/downloader/omnifetch");
 
-    private static final String KEY_DARK_MODE = "ui.darkMode";
+    private static final String KEY_THEME_MODE = "ui.themeMode";
+    /** 旧版主题键（布尔），仅用于一次性迁移 */
+    private static final String KEY_LEGACY_DARK = "ui.darkMode";
 
     private AppPrefs() {
     }
 
-    /** 是否使用深色主题，默认浅色。 */
-    public static boolean isDarkMode() {
-        return PREFS.getBoolean(KEY_DARK_MODE, false);
+    /**
+     * 读取主题模式，默认跟随系统。
+     * 兼容旧版本只存 ui.darkMode 布尔键的情况：首次读取时迁移为新键。
+     */
+    public static ThemeMode getThemeMode() {
+        String stored = PREFS.get(KEY_THEME_MODE, null);
+        if (stored != null) {
+            try {
+                return ThemeMode.valueOf(stored);
+            } catch (IllegalArgumentException e) {
+                // 存储值非法，落到默认
+            }
+        }
+        // 迁移旧布尔键
+        if (PREFS.get(KEY_LEGACY_DARK, null) != null) {
+            ThemeMode migrated = PREFS.getBoolean(KEY_LEGACY_DARK, false)
+                    ? ThemeMode.DARK : ThemeMode.LIGHT;
+            setThemeMode(migrated);
+            PREFS.remove(KEY_LEGACY_DARK);
+            flushQuietly();
+            return migrated;
+        }
+        return ThemeMode.SYSTEM;
     }
 
-    /** 持久化主题选择；写入失败仅记录，不影响界面切换。 */
-    public static void setDarkMode(boolean darkMode) {
-        PREFS.putBoolean(KEY_DARK_MODE, darkMode);
+    /** 持久化主题模式；写入失败仅记录，不影响界面切换。 */
+    public static void setThemeMode(ThemeMode mode) {
+        PREFS.put(KEY_THEME_MODE, mode.name());
+        flushQuietly();
+    }
+
+    private static void flushQuietly() {
         try {
             PREFS.flush();
         } catch (BackingStoreException e) {

@@ -184,6 +184,19 @@ public final class UiIcons {
         });
     }
 
+    /** 跟随系统（左半实心右半描边的圆 + 上下短光线，表示深浅各半） */
+    public static Icon themeAuto() {
+        return icon(16, g -> {
+            circle(g, 8, 8, 3.1);
+            Path2D half = new Path2D.Float();
+            half.append(new Arc2D.Double(4.9, 4.9, 6.2, 6.2, 90, 180, Arc2D.PIE), true);
+            half.closePath();
+            g.fill(half);
+            line(g, 8, 2.4, 8, 3.6);
+            line(g, 8, 12.4, 8, 13.6);
+        });
+    }
+
     /** 退出（电源符号） */
     public static Icon power() {
         return icon(16, g -> {
