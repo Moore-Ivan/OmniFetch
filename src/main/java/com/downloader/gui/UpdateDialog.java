@@ -429,8 +429,8 @@ final class UpdateDialog extends JDialog {
     // ══════ 发布页 / 安装 / 关闭 ══════
 
     private void openReleasePage() {
-        // 统一打开 Releases 列表页（不进入具体 tag）
-        String pageUrl = UpdateChecker.RELEASES_PAGE_URL;
+        // 直接进入本次更新对应的具体版本页
+        String pageUrl = UpdateChecker.releasePageUrl(result.latestVersion);
         try {
             if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
                 Desktop.getDesktop().browse(URI.create(pageUrl));

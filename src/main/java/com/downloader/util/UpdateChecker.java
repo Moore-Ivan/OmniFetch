@@ -19,9 +19,11 @@ public final class UpdateChecker {
 
     private static final String REPO_API =
             "https://api.github.com/repos/Moore-Ivan/OmniFetch/releases/latest";
-    /** Releases 列表页（"查看发布页"统一打开此页，不进入具体 tag） */
+    /** Releases 列表页 */
     public static final String RELEASES_PAGE_URL =
             "https://github.com/Moore-Ivan/OmniFetch/releases";
+    /** 具体版本页前缀（"查看发布页"直接进入对应 tag，形如 /releases/tag/v1.0.1） */
+    private static final String RELEASE_PAGE_PREFIX = RELEASES_PAGE_URL + "/tag/";
     /** 网页端 latest：302 跳转到最新 tag 页面，不受 GitHub API 每 IP 限流（403/429）影响 */
     private static final String REPO_LATEST_PAGE = RELEASES_PAGE_URL + "/latest";
 
@@ -82,6 +84,19 @@ public final class UpdateChecker {
         static Result error(String msg) {
             return new Result(false, null, msg, null, null);
         }
+    }
+
+    /**
+     * 具体版本的发布页 URL（形如 /releases/tag/v1.0.1）。
+     *
+     * @param version 版本号，带不带 v 前缀均可
+     */
+    public static String releasePageUrl(String version) {
+        if (version == null || version.isBlank()) {
+            return RELEASES_PAGE_URL;
+        }
+        String v = version.trim();
+        return RELEASE_PAGE_PREFIX + (v.startsWith("v") ? v : "v" + v);
     }
 
     /**
