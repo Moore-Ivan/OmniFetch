@@ -149,6 +149,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private boolean pathFieldEdited = false;
     /** 程序化同步路径输入框时抑制"用户已编辑"标记（区分用户输入与代码 setText） */
     private boolean syncingPath = false;
+    /** 剪贴板下载链接监视器（是否启用与间隔均由高级配置控制） */
+    private ClipboardMonitor clipboardMonitor;
+    /** 剪贴板确认对话框正在显示，防止重复弹窗 */
+    private boolean clipboardPromptShowing = false;
     /** 前景色需跟随主题的次要标签（自定义前景色不会被 updateComponentTreeUI 自动替换） */
     private final List<JLabel> hintLabels = new ArrayList<>();
     /** 进度条渲染器不在组件树中，换肤后需手动刷新其内部组件 */
@@ -172,6 +176,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         syncThemeWatcher();
         registerDownloadEventNotifications();
         registerConfigSync();
+        registerClipboardWatcher();
     }
 
     /**
@@ -226,6 +231,63 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                         syncingPath = false;
                     }
                 }));
+    }
+
+    /**
+     * 启用剪贴板监视：发现新复制的下载链接时询问用户是否立即下载。
+     * 开关与检测间隔读取「高级配置 → 剪贴板配置」，配置保存后即时生效（无需重启）。
+     */
+    private void registerClipboardWatcher() {
+        clipboardMonitor = new ClipboardMonitor(this::onClipboardLink);
+        // 配置事件可能来自 config-watcher 线程，统一切回 EDT 后再启停 / 调频
+        EventBus.getInstance().registerConfigChangeListener(
+                event -> EventQueue.invokeLater(this::syncClipboardMonitor));
+        syncClipboardMonitor();
+    }
+
+    /** 按当前配置启停剪贴板监视；间隔变化即时生效 */
+    private void syncClipboardMonitor() {
+        if (clipboardMonitor == null) {
+            return;
+        }
+        if (ConfigManager.getInstance().getBoolean("clipboard.monitorEnabled", true)) {
+            clipboardMonitor.setIntervalMs(
+                    ConfigManager.getInstance().getInt("clipboard.pollIntervalMs", 1_000));
+            clipboardMonitor.start();
+        } else {
+            clipboardMonitor.stop();
+        }
+    }
+
+    /**
+     * 剪贴板中发现下载链接：确认后直接加入队列，保存到配置的默认保存路径。
+     * 回调运行在 EDT（Swing Timer）上，可直接操作界面。
+     */
+    private void onClipboardLink(String url) {
+        if (clipboardPromptShowing) {
+            return;
+        }
+        clipboardPromptShowing = true;
+        try {
+            // 与退出确认同理：最小化时直接弹模态框会出现"幽灵窗口"（内容空白、点击无响应），
+            // 先把窗口恢复并置前，再弹确认框
+            if (getExtendedState() == JFrame.ICONIFIED) {
+                setExtendedState(JFrame.NORMAL);
+            }
+            setVisible(true);
+            toFront();
+
+            String display = url.length() > 120 ? url.substring(0, 117) + "..." : url;
+            int choice = JOptionPane.showConfirmDialog(this,
+                    "在剪贴板中发现下载链接：\n" + display + "\n\n是否立即开始下载？",
+                    "发现下载链接", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (choice == JOptionPane.OK_OPTION) {
+                downloadManager.addTask(url, resolveDefaultSaveDir(), "", "");
+                Toast.success(this, "下载任务已添加");
+            }
+        } finally {
+            clipboardPromptShowing = false;
+        }
     }
 
     /** 在系统文件管理器中定位文件（Windows 用 explorer /select 选中文件，其他平台打开所在目录） */
@@ -1160,6 +1222,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private void copyText(String text, String successMsg) {
         Toolkit.getDefaultToolkit().getSystemClipboard()
                 .setContents(new StringSelection(text), null);
+        // 标记为已处理，避免刚复制的链接立刻又被剪贴板监视器弹窗询问
+        if (clipboardMonitor != null) {
+            clipboardMonitor.markSeen(text);
+        }
         Toast.info(this, successMsg);
     }
 

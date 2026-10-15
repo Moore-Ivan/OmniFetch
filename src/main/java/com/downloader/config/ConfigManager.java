@@ -113,6 +113,9 @@ public class ConfigManager {
         // 插件配置
         bool("插件配置", "plugin.enabled", "是否启用插件", true);
         text("插件配置", "plugin.dir", "插件目录", "plugins");
+        // 剪贴板配置
+        bool("剪贴板配置", "clipboard.monitorEnabled", "自动识别剪贴板下载链接", true);
+        number("剪贴板配置", "clipboard.pollIntervalMs", "剪贴板检测间隔", "毫秒", 200, 10_000, 100, 1_000);
     }
 
     private static ConfigManager instance;
