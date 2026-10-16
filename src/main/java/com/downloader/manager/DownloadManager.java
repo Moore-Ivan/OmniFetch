@@ -23,16 +23,27 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class DownloadManager implements ConfigChangeListener {
 
     private static DownloadManager instance;
-    
+
+    /** 任务队列必须有界：无界队列会让 ThreadPoolExecutor 的 maximumPoolSize 永远不生效 */
+    private static final int TASK_QUEUE_CAPACITY = 1000;
+
     private final BlockingQueue<DownloadTask> taskQueue;
     private final ExecutorService threadPool;
     private final ScheduledExecutorService retryScheduler;
     private final Set<DownloadTask> runningTasks;
     private final Map<String, DownloadTask> taskMap;
+    /** 任务插入顺序（ConcurrentHashMap 不保证迭代顺序，界面会跳动） */
+    private final List<String> taskIdOrder = new CopyOnWriteArrayList<>();
+    /** 任务处理器线程引用，shutdown 时需要显式中断 */
+    private volatile Thread taskProcessorThread;
 
     private final AtomicInteger taskIdGenerator = new AtomicInteger(1);
     private final ConfigManager configManager = ConfigManager.getInstance();
     private final EventBus eventBus = EventBus.getInstance();
+    /** 历史下载记录持久化（config/history.json） */
+    private final HistoryStore historyStore;
+    /** 启动时从历史记录恢复的任务数（界面用于提示） */
+    private volatile int restoredTaskCount = 0;
 
     // 从配置中获取最大并发任务数
     private int getMaxConcurrentTasks() {
@@ -50,13 +61,15 @@ public class DownloadManager implements ConfigChangeListener {
     }
 
     private DownloadManager() {
-        taskQueue = new LinkedBlockingQueue<>();
+        taskQueue = new LinkedBlockingQueue<>(TASK_QUEUE_CAPACITY);
+        int corePoolSize = Math.max(1,
+                Math.min(getMaxConcurrentTasks(), getMaxThreads()));
         threadPool = new ThreadPoolExecutor(
-                getMaxConcurrentTasks(),
-                getMaxThreads(),
+                corePoolSize,
+                Math.max(1, getMaxThreads()),
                 60L,
                 TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(),
+                new LinkedBlockingQueue<>(TASK_QUEUE_CAPACITY),
                 new ThreadPoolExecutor.CallerRunsPolicy()
         );
         // 重试退避定时器：独立于下载线程池，避免重试等待占用下载线程造成饥饿
@@ -68,11 +81,17 @@ public class DownloadManager implements ConfigChangeListener {
         runningTasks = ConcurrentHashMap.newKeySet();
         taskMap = new ConcurrentHashMap<>();
 
+        // 历史记录持久化：启动时加载恢复，状态变化后定时落盘
+        historyStore = new HistoryStore(this::getAllTasks);
+
         // 注册为配置变更监听器
         EventBus.getInstance().registerConfigChangeListener(this);
 
         // 启动任务处理器
         startTaskProcessor();
+
+        // 恢复历史任务（默认暂停，不自动入队下载）
+        restoreHistory();
     }
 
     public static synchronized DownloadManager getInstance() {
@@ -99,8 +118,9 @@ public class DownloadManager implements ConfigChangeListener {
                     break;
                 }
             }
-        });
-        // 改为非守护线程，确保任务处理器能够一直运行
+        }, "task-processor");
+        taskProcessorThread = processor;
+        // 改为非守护线程，确保任务处理器能够一直运行；shutdown() 时显式中断
         processor.setDaemon(false);
         processor.start();
     }
@@ -116,13 +136,68 @@ public class DownloadManager implements ConfigChangeListener {
                 ProtocolDetector.detect(url)
         );
         
+        // 有界队列：极端积压时明确失败，避免任务进了列表却永远不会被调度
+        if (!taskQueue.offer(task)) {
+            throw new IllegalStateException(
+                    "下载任务队列已满（上限 " + TASK_QUEUE_CAPACITY + "），请先清理任务后再试");
+        }
         taskMap.put(taskId, task);
-        taskQueue.offer(task);
-        
+        taskIdOrder.add(taskId);
+
         // 发布任务添加事件
         eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_ADDED, task));
-        
+        historyStore.markDirty();
+
         return taskId;
+    }
+
+    /**
+     * 启动时从 config/history.json 恢复历史任务：
+     * COMPLETED/FAILED 原样保留（失败任务保留错误信息），其余一律恢复为 PAUSED；
+     * 任务 ID 序号从历史最大值继续，避免与恢复的任务冲突。
+     */
+    private void restoreHistory() {
+        try {
+            List<Map<String, Object>> records = historyStore.load();
+            int maxId = 0;
+            int count = 0;
+            for (Map<String, Object> record : records) {
+                DownloadTask task = HistoryStore.fromRecord(record);
+                if (task == null) {
+                    continue;
+                }
+                taskMap.put(task.getId(), task);
+                taskIdOrder.add(task.getId());
+                maxId = Math.max(maxId, parseTaskIdSuffix(task.getId()));
+                count++;
+            }
+            if (maxId > 0) {
+                taskIdGenerator.set(maxId + 1);
+            }
+            restoredTaskCount = count;
+            if (count > 0) {
+                System.out.println("已恢复 " + count + " 条历史下载记录");
+            }
+        } catch (Exception e) {
+            System.err.println("恢复历史下载记录失败: " + e.getMessage());
+        }
+    }
+
+    /** 解析 "task_N" 形式 ID 的数字后缀（非该格式返回 0） */
+    private static int parseTaskIdSuffix(String id) {
+        if (id == null || !id.startsWith("task_")) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(id.substring(5));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** 启动时恢复的历史任务数（无恢复时为 0） */
+    public int getRestoredTaskCount() {
+        return restoredTaskCount;
     }
 
     private void executeTask(DownloadTask task) {
@@ -246,7 +321,14 @@ public class DownloadManager implements ConfigChangeListener {
             // 延迟后重新加入队列（独立调度线程，不占用下载线程池）
             retryScheduler.schedule(() -> {
                 if (task.getStatus() == DownloadTask.TaskStatus.WAITING) {
-                    taskQueue.offer(task);
+                    if (!taskQueue.offer(task)) {
+                        // 队列满（极端积压）：直接标记失败而不是静默丢弃
+                        task.setStatus(DownloadTask.TaskStatus.FAILED);
+                        task.setErrorMessage("任务队列已满，重试无法入队");
+                        notifyTaskUpdated(task);
+                        eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_FAILED, task, "任务队列已满"));
+                        return;
+                    }
                     notifyTaskUpdated(task);
                     // 发布任务重试事件
                     eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_RETRYING, task, errorMessage));
@@ -275,13 +357,29 @@ public class DownloadManager implements ConfigChangeListener {
 
     public void resumeTask(String taskId) {
         DownloadTask task = taskMap.get(taskId);
-        if (task != null && task.getStatus() == DownloadTask.TaskStatus.PAUSED) {
-            task.setStatus(DownloadTask.TaskStatus.WAITING);
-            taskQueue.offer(task);
-            notifyTaskUpdated(task);
-            // 发布任务恢复事件
-            eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_RESUMED, task));
+        if (task == null) {
+            return;
         }
+        DownloadTask.TaskStatus status = task.getStatus();
+        // 暂停任务继续；失败任务手动重试（清空错误、重置重试计数重新入队）
+        if (status != DownloadTask.TaskStatus.PAUSED
+                && status != DownloadTask.TaskStatus.FAILED) {
+            return;
+        }
+        if (status == DownloadTask.TaskStatus.FAILED) {
+            task.resetRetryCount();
+            task.setErrorMessage(null);
+        }
+        task.setStatus(DownloadTask.TaskStatus.WAITING);
+        if (!taskQueue.offer(task)) {
+            task.setStatus(DownloadTask.TaskStatus.FAILED);
+            task.setErrorMessage("任务队列已满，无法开始任务");
+            notifyTaskUpdated(task);
+            return;
+        }
+        notifyTaskUpdated(task);
+        // 发布任务恢复事件
+        eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_RESUMED, task));
     }
 
     public void cancelTask(String taskId) {
@@ -297,17 +395,27 @@ public class DownloadManager implements ConfigChangeListener {
 
     public void removeTask(String taskId) {
         DownloadTask task = taskMap.remove(taskId);
+        taskIdOrder.remove(taskId);
         if (task != null) {
             runningTasks.remove(task);
             taskQueue.remove(task);
             task.close();
             // 发布任务移除事件
             eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_REMOVED, task));
+            historyStore.markDirty();
         }
     }
 
+    /** 按任务添加顺序返回（ConcurrentHashMap 自身顺序不确定） */
     public List<DownloadTask> getAllTasks() {
-        return new ArrayList<>(taskMap.values());
+        List<DownloadTask> ordered = new ArrayList<>(taskIdOrder.size());
+        for (String id : taskIdOrder) {
+            DownloadTask task = taskMap.get(id);
+            if (task != null) {
+                ordered.add(task);
+            }
+        }
+        return ordered;
     }
 
     public DownloadTask getTask(String taskId) {
@@ -315,6 +423,8 @@ public class DownloadManager implements ConfigChangeListener {
     }
 
     private void notifyTaskUpdated(DownloadTask task) {
+        // 高频进度更新只打脏标记（volatile 写），由 history-saver 每 2 秒节流落盘
+        historyStore.markDirty();
         // 发布任务更新事件
         eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_UPDATED, task));
     }
@@ -356,8 +466,18 @@ public class DownloadManager implements ConfigChangeListener {
     }
 
     public void shutdown() {
+        // 先落盘历史记录（此时 DOWNLOADING 状态仍真实，保存时映射为 PAUSED），再取消任务，
+        // 避免"取消"把任务标成 FAILED 后被当作真实失败写入历史
+        historyStore.shutdown();
+
         // 停止重试退避调度
         retryScheduler.shutdownNow();
+
+        // 中断任务处理器线程（非守护线程，不中断会阻止 JVM 退出）
+        Thread processor = taskProcessorThread;
+        if (processor != null) {
+            processor.interrupt();
+        }
 
         // 取消所有正在执行的任务
         for (DownloadTask task : runningTasks) {
@@ -387,19 +507,29 @@ public class DownloadManager implements ConfigChangeListener {
     
     @Override
     public void onConfigChange(ConfigChangeEvent event) {
-        System.out.println("配置文件变更: " + event.getConfigFile());
         // 重新配置线程池大小
-        int newMaxConcurrentTasks = getMaxConcurrentTasks();
-        int newMaxThreads = getMaxThreads();
-        
-        System.out.println("更新线程池配置: 最大并发任务数=" + newMaxConcurrentTasks + ", 最大线程数=" + newMaxThreads);
-        
-        // 这里可以添加线程池重新配置的逻辑
-        // 注意：ThreadPoolExecutor 的核心线程数和最大线程数是可以动态调整的
-        if (threadPool instanceof ThreadPoolExecutor) {
-            ThreadPoolExecutor executor = (ThreadPoolExecutor) threadPool;
-            executor.setCorePoolSize(newMaxConcurrentTasks);
-            executor.setMaximumPoolSize(newMaxThreads);
+        int newMaxConcurrentTasks = Math.max(1, getMaxConcurrentTasks());
+        int newMaxThreads = Math.max(1, getMaxThreads());
+
+        // 外部直接编辑配置可能产生 core > max，钳制到合法关系（界面保存有交叉校验，这里兜底）
+        if (newMaxConcurrentTasks > newMaxThreads) {
+            newMaxConcurrentTasks = newMaxThreads;
+        }
+
+        // ThreadPoolExecutor 始终要求 core <= max，扩容与缩容的调整顺序相反：
+        // 扩容先抬 max，缩容先压 core，否则会抛 IllegalArgumentException
+        if (threadPool instanceof ThreadPoolExecutor executor) {
+            try {
+                if (newMaxThreads >= executor.getCorePoolSize()) {
+                    executor.setMaximumPoolSize(newMaxThreads);
+                    executor.setCorePoolSize(newMaxConcurrentTasks);
+                } else {
+                    executor.setCorePoolSize(newMaxConcurrentTasks);
+                    executor.setMaximumPoolSize(newMaxThreads);
+                }
+            } catch (IllegalArgumentException e) {
+                System.err.println("线程池配置更新失败: " + e.getMessage());
+            }
         }
     }
 }

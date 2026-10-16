@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * 应用更新检查器。
@@ -149,19 +150,44 @@ public final class UpdateChecker {
 
         String body = response.body();
 
-        // 简单解析 JSON（不引入第三方依赖）
-        String tag = extractText(body, "tag_name");
-        String notes = extractText(body, "body");
-
-        if (tag == null) {
+        // 用内置最小 JSON 解析器解析（不引入第三方依赖，且比正则可靠：
+        // 正则无法处理嵌套对象与字符串内转义，可能误匹配 uploader.name 等字段）
+        Object root;
+        try {
+            root = MiniJson.parse(body);
+        } catch (IOException e) {
             return Result.error("无法解析版本信息");
+        }
+        if (!(root instanceof Map<?, ?> rootMap)) {
+            return Result.error("无法解析版本信息");
+        }
+
+        Object tagValue = rootMap.get("tag_name");
+        if (!(tagValue instanceof String tag) || tag.isBlank()) {
+            return Result.error("无法解析版本信息");
+        }
+
+        String notes = rootMap.get("body") instanceof String b ? b : null;
+        List<Asset> assets = new ArrayList<>();
+        if (rootMap.get("assets") instanceof List<?> assetList) {
+            for (Object item : assetList) {
+                if (!(item instanceof Map<?, ?> asset)) {
+                    continue;
+                }
+                String name = asset.get("name") instanceof String n ? n : null;
+                String url = asset.get("browser_download_url") instanceof String u ? u : null;
+                long size = asset.get("size") instanceof Number num ? num.longValue() : -1;
+                if (name != null && url != null) {
+                    assets.add(new Asset(name, url, size));
+                }
+            }
         }
 
         // tag 形如 "v1.0.0"，去掉前缀
         String latest = tag.startsWith("v") ? tag.substring(1) : tag;
 
         if (isNewerVersion(currentVersion, latest)) {
-            return Result.hasUpdate(latest, extractAssets(body), notes);
+            return Result.hasUpdate(latest, assets, notes);
         } else {
             return Result.noUpdate(latest);
         }
@@ -309,135 +335,5 @@ public final class UpdateChecker {
             }
         }
         return result;
-    }
-
-    /**
-     * 解析 assets 数组中的每个资产对象（name / browser_download_url / size）。
-     */
-    private static List<Asset> extractAssets(String json) {
-        List<Asset> assets = new ArrayList<>();
-        int keyIdx = json.indexOf("\"assets\"");
-        if (keyIdx < 0) {
-            return assets;
-        }
-        int arrStart = json.indexOf('[', keyIdx);
-        if (arrStart < 0) {
-            return assets;
-        }
-        // 匹配数组闭合括号
-        int depth = 0;
-        int arrEnd = -1;
-        for (int i = arrStart; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '[') {
-                depth++;
-            } else if (c == ']') {
-                depth--;
-                if (depth == 0) {
-                    arrEnd = i;
-                    break;
-                }
-            }
-        }
-        if (arrEnd < 0) {
-            return assets;
-        }
-        String arr = json.substring(arrStart + 1, arrEnd);
-
-        // 逐对象截取（资产字段值不含大括号，简单括号配对即可）
-        int objStart = -1;
-        int objDepth = 0;
-        for (int i = 0; i < arr.length(); i++) {
-            char c = arr.charAt(i);
-            if (c == '{') {
-                if (objDepth == 0) {
-                    objStart = i;
-                }
-                objDepth++;
-            } else if (c == '}') {
-                objDepth--;
-                if (objDepth == 0 && objStart >= 0) {
-                    Asset asset = parseAsset(arr.substring(objStart, i + 1));
-                    if (asset != null) {
-                        assets.add(asset);
-                    }
-                    objStart = -1;
-                }
-            }
-        }
-        return assets;
-    }
-
-    private static Asset parseAsset(String objJson) {
-        String name = extractText(objJson, "name");
-        String url = extractText(objJson, "browser_download_url");
-        long size = extractLong(objJson, "size");
-        if (name == null || url == null) {
-            return null;
-        }
-        return new Asset(name, url, size);
-    }
-
-    /**
-     * 从 JSON 中提取字符串值，正确处理反斜杠转义（\"、\n 等）。
-     */
-    private static String extractText(String json, String key) {
-        String search = "\"" + key + "\"";
-        int idx = json.indexOf(search);
-        if (idx < 0) return null;
-        idx = json.indexOf(':', idx);
-        if (idx < 0) return null;
-        idx = json.indexOf('"', idx);
-        if (idx < 0) return null;
-
-        StringBuilder sb = new StringBuilder();
-        for (int j = idx + 1; j < json.length(); j++) {
-            char c = json.charAt(j);
-            if (c == '\\' && j + 1 < json.length()) {
-                char next = json.charAt(j + 1);
-                switch (next) {
-                    case 'n'  -> sb.append('\n');
-                    case 'r'  -> sb.append('\r');
-                    case 't'  -> sb.append('\t');
-                    case '"'  -> sb.append('"');
-                    case '\\' -> sb.append('\\');
-                    case '/'  -> sb.append('/');
-                    default   -> sb.append(next);
-                }
-                j++;
-            } else if (c == '"') {
-                return sb.toString();
-            } else {
-                sb.append(c);
-            }
-        }
-        return null;
-    }
-
-    /**
-     * 从 JSON 中提取整数值。
-     */
-    private static long extractLong(String json, String key) {
-        String search = "\"" + key + "\"";
-        int idx = json.indexOf(search);
-        if (idx < 0) return -1;
-        idx = json.indexOf(':', idx);
-        if (idx < 0) return -1;
-        int j = idx + 1;
-        while (j < json.length() && !Character.isDigit(json.charAt(j))) {
-            j++;
-        }
-        int start = j;
-        while (j < json.length() && Character.isDigit(json.charAt(j))) {
-            j++;
-        }
-        if (start == j) {
-            return -1;
-        }
-        try {
-            return Long.parseLong(json.substring(start, j));
-        } catch (NumberFormatException e) {
-            return -1;
-        }
     }
 }

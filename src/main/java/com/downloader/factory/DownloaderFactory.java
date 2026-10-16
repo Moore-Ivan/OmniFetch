@@ -41,8 +41,11 @@ public final class DownloaderFactory {
             case FTP: {
                 String host = FileUtils.extractHost(url);
                 int port = FileUtils.extractPort(url, 21);
-                String u = FileUtils.extractUser(url, "anonymous");
-                String p = FileUtils.extractPass(url, "");
+                // 与 SFTP 一致：优先使用界面传入的凭据，为空再回退 URL 内嵌信息/匿名
+                String u = (user != null && !user.isBlank())
+                        ? user : FileUtils.extractUser(url, "anonymous");
+                String p = (pass != null && !pass.isBlank())
+                        ? pass : FileUtils.extractPass(url, "");
                 String path = FileUtils.extractPath(url);
                 return new FtpDownloader(host, port, u, p, path,
                         savePath, callback);

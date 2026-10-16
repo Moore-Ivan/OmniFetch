@@ -19,8 +19,15 @@ public final class ProtocolDetector {
         if (lower.startsWith("magnet:")) {
             return Protocol.MAGNET;
         }
-        if (lower.endsWith(".torrent")) {
-            return Protocol.TORRENT;
+        // 必须先识别 HTTP(S)：http://host/a.torrent 是一个需要先下载的网络资源，
+        // 若按后缀误判为 TORRENT，会把整段 URL 当本地路径打开直接失败
+        if (lower.startsWith("http://") || lower.startsWith("https://")) {
+            if (lower.contains(".m3u8")) {
+                return Protocol.M3U8_HLS;
+            }
+            // 以 .torrent 结尾的 HTTP 链接：按普通 HTTP 文件下载种子本身，
+            // 用户拿到种子后可再用本地文件方式发起 BT 任务
+            return Protocol.HTTP_HTTPS;
         }
         if (lower.startsWith("sftp://")) {
             return Protocol.SFTP;
@@ -28,11 +35,9 @@ public final class ProtocolDetector {
         if (lower.startsWith("ftp://")) {
             return Protocol.FTP;
         }
-        if (lower.startsWith("http://") || lower.startsWith("https://")) {
-            if (lower.contains(".m3u8")) {
-                return Protocol.M3U8_HLS;
-            }
-            return Protocol.HTTP_HTTPS;
+        // 本地（或裸路径）的 .torrent 文件才走 BitTorrent 协议
+        if (lower.endsWith(".torrent")) {
+            return Protocol.TORRENT;
         }
 
         return Protocol.UNKNOWN;

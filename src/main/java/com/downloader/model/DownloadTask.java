@@ -33,7 +33,8 @@ public class DownloadTask {
     private final String url;
     private final String savePath;
     private final String username;
-    private final String password;
+    /** 非 final：历史恢复的任务不落盘密码，继续/重试时由界面补输 */
+    private volatile String password;
     private final Protocol protocol;
 
     private volatile TaskStatus status = TaskStatus.WAITING;
@@ -80,6 +81,10 @@ public class DownloadTask {
 
     public String getPassword() {
         return password;
+    }
+
+    public void setPassword(String password) {
+        this.password = password;
     }
 
     public Protocol getProtocol() {
@@ -215,6 +220,10 @@ public class DownloadTask {
     // 重试相关方法
     public int getRetryCount() {
         return retryCount;
+    }
+
+    public void setRetryCount(int retryCount) {
+        this.retryCount = retryCount;
     }
 
     public void incrementRetryCount() {

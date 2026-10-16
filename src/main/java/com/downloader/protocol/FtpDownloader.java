@@ -62,16 +62,6 @@ public class FtpDownloader implements DownloadProtocol {
                     + pasvAddr[2] + "." + pasvAddr[3];
             int dataPort = pasvAddr[4];
 
-            // 发送 RETR
-            connection.sendCommand("RETR " + remotePath, 150);
-
-            // 建立数据连接
-            Socket dataSocket = new Socket();
-            dataSocket.connect(
-                    new InetSocketAddress(dataIp, dataPort), 10000);
-            // 读超时防止服务器假死导致任务永久卡在"下载中"
-            dataSocket.setSoTimeout(READ_TIMEOUT_MS);
-
             String fileName = remotePath.contains("/")
                     ? remotePath.substring(remotePath.lastIndexOf('/') + 1)
                     : remotePath;
@@ -89,6 +79,18 @@ public class FtpDownloader implements DownloadProtocol {
                 }
             }
 
+            // 先建立数据连接再发 RETR（标准顺序）：部分服务器在 RETR 后立即推数据，
+            // 晚连接会依赖 socket backlog 缓冲，极端情况下死锁
+            Socket dataSocket = new Socket();
+            dataSocket.connect(
+                    new InetSocketAddress(dataIp, dataPort), 10000);
+            // 读超时防止服务器假死导致任务永久卡在"下载中"
+            dataSocket.setSoTimeout(READ_TIMEOUT_MS);
+
+            // 发送 RETR：150（文件状态正确，即将打开数据连接）
+            // 或 125（数据连接已打开，传输开始）都是合法响应
+            connection.sendCommand("RETR " + remotePath, 150, 125);
+
             try (InputStream in = dataSocket.getInputStream();
                  FileOutputStream fos = new FileOutputStream(saveFile)) {
 
@@ -102,7 +104,8 @@ public class FtpDownloader implements DownloadProtocol {
                 while ((read = in.read(buf)) != -1) {
                     if (cancelled) {
                         saveFile.delete();
-                        try { connection.sendCommand("ABOR", 226); }
+                        // ABOR 合法响应：225（数据连接已关闭）或 226（传输已中止）
+                        try { connection.sendCommand("ABOR", 225, 226); }
                         catch (Exception ignored) {}
                         return;
                     }

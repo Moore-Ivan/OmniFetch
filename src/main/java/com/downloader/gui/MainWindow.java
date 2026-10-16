@@ -3,7 +3,6 @@ package com.downloader.gui;
 import com.downloader.Main;
 import com.downloader.config.ConfigManager;
 import com.downloader.detector.ProtocolDetector;
-import com.downloader.event.DownloadEvent;
 import com.downloader.event.EventBus;
 import com.downloader.manager.DownloadManager;
 import com.downloader.model.DownloadTask;
@@ -75,7 +74,6 @@ import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -1078,16 +1076,20 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     private void selectAllTasks() {
+        // 只遍历视图行（搜索过滤后可见的任务），避免把被 RowFilter 隐藏的任务也选中
+        int viewRowCount = taskTable.getRowCount();
         boolean select = true;
-        if (taskModel.getRowCount() > 0) {
-            String firstTaskId = (String) taskModel.getValueAt(0, 1);
+        if (viewRowCount > 0) {
+            int firstModelRow = taskTable.convertRowIndexToModel(0);
+            String firstTaskId = (String) taskModel.getValueAt(firstModelRow, 1);
             select = !selectedTasks.getOrDefault(firstTaskId, false);
         }
 
-        for (int i = 0; i < taskModel.getRowCount(); i++) {
-            String taskId = (String) taskModel.getValueAt(i, 1);
+        for (int viewRow = 0; viewRow < viewRowCount; viewRow++) {
+            int modelRow = taskTable.convertRowIndexToModel(viewRow);
+            String taskId = (String) taskModel.getValueAt(modelRow, 1);
             selectedTasks.put(taskId, select);
-            taskModel.setValueAt(select, i, 0);
+            taskModel.setValueAt(select, modelRow, 0);
         }
         taskTable.repaint();
     }
@@ -1100,8 +1102,39 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     private void resumeSelectedTasks() {
         for (String taskId : getSelectedTaskIds()) {
-            downloadManager.resumeTask(taskId);
+            DownloadTask task = downloadManager.getTask(taskId);
+            // 历史恢复的 FTP/SFTP 任务不含密码，补输成功才继续
+            if (task != null && ensureCredentials(task)) {
+                downloadManager.resumeTask(taskId);
+            }
         }
+    }
+
+    /**
+     * 历史恢复的任务不落盘密码：FTP/SFTP 且已保存用户名但密码为空时，
+     * 继续/重试前弹出密码补输框（取消则不恢复该任务）。
+     */
+    private boolean ensureCredentials(DownloadTask task) {
+        Protocol protocol = task.getProtocol();
+        boolean needPassword = (protocol == Protocol.FTP || protocol == Protocol.SFTP)
+                && task.getUsername() != null && !task.getUsername().isBlank()
+                && (task.getPassword() == null || task.getPassword().isEmpty());
+        if (!needPassword) {
+            return true;
+        }
+        JPasswordField passwordField = new JPasswordField(20);
+        Object[] message = {
+                "任务「" + safeFileName(task) + "」需要 " + protocol.displayName + " 登录密码（用户名："
+                        + task.getUsername() + "）：",
+                passwordField
+        };
+        int result = JOptionPane.showConfirmDialog(this, message, "输入密码",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (result != JOptionPane.OK_OPTION) {
+            return false;
+        }
+        task.setPassword(new String(passwordField.getPassword()));
+        return true;
     }
 
     private void deleteSelectedTasks() {
@@ -1186,8 +1219,27 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             }
             case PAUSED -> {
                 JMenuItem resumeItem = new JMenuItem("继续", UiIcons.resume());
-                resumeItem.addActionListener(e -> downloadManager.resumeTask(task.getId()));
+                resumeItem.addActionListener(e -> {
+                    if (ensureCredentials(task)) {
+                        downloadManager.resumeTask(task.getId());
+                    }
+                });
                 menu.add(resumeItem);
+            }
+            case FAILED -> {
+                JMenuItem retryItem = new JMenuItem("重试", UiIcons.resume());
+                retryItem.addActionListener(e -> {
+                    if (ensureCredentials(task)) {
+                        downloadManager.resumeTask(task.getId());
+                    }
+                });
+                menu.add(retryItem);
+                if (task.getErrorMessage() != null && !task.getErrorMessage().isBlank()) {
+                    JMenuItem errorItem = new JMenuItem("查看错误信息", UiIcons.warning());
+                    errorItem.addActionListener(e -> JOptionPane.showMessageDialog(this,
+                            task.getErrorMessage(), "错误信息", JOptionPane.ERROR_MESSAGE));
+                    menu.add(errorItem);
+                }
             }
             default -> { }
         }
@@ -1250,7 +1302,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     private void showExitConfirm() {
-        String message = "确定要退出？\n未完成的下载任务将被取消。";
+        String message = "确定要退出？\n未完成的下载任务将自动暂停，重启后可继续下载。";
         if (activeUpdateDialog != null && activeUpdateDialog.isDownloadActive()) {
             message += "\n更新包正在后台下载，退出将中断（已下载部分保留，下次可断点续传）。";
         }
@@ -1277,6 +1329,15 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     private void initWindowListener() {
         addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowOpened(WindowEvent e) {
+                // 首次显示窗口后提示历史恢复结果（Toast 依赖可见窗口）
+                int restored = downloadManager.getRestoredTaskCount();
+                if (restored > 0) {
+                    Toast.info(MainWindow.this, "已恢复 " + restored + " 条历史下载记录，暂停/失败的任务可继续");
+                }
+            }
+
             @Override
             public void windowClosing(WindowEvent e) {
                 handleExit();

@@ -3,14 +3,20 @@ package com.downloader.protocol;
 import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
 import com.downloader.util.FileUtils;
+import com.downloader.util.HttpTrust;
 import java.io.*;
 import java.net.*;
 import java.net.http.*;
 import java.nio.channels.*;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import static java.nio.file.StandardOpenOption.*;
 import java.time.Duration;
+import javax.net.ssl.SSLHandshakeException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -91,11 +97,17 @@ public class HttpDownloader implements DownloadProtocol {
 
     @Override
     public void download() throws Exception {
-        httpClient = HttpClient.newBuilder()
+        HttpClient.Builder clientBuilder = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_2)
                 .connectTimeout(Duration.ofSeconds(getConnectTimeoutSec()))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+                .followRedirects(HttpClient.Redirect.NORMAL);
+        // 与更新检查/更新包下载共用 HttpTrust：信任所有证书。GitHub 等站点在本机
+        // 常被加速工具（hosts 指向 127.0.0.1）用自签证书接管，或运行环境 cacerts 不全，
+        // 不配置会以 PKIX/certificate_unknown 直接失败（更新链路早已这样处理，下载器此前漏配）
+        if (HttpTrust.SSL_CONTEXT != null) {
+            clientBuilder.sslContext(HttpTrust.SSL_CONTEXT);
+        }
+        httpClient = clientBuilder.build();
 
         // 先检查是否已取消
         if (cancelled) {
@@ -110,8 +122,14 @@ public class HttpDownloader implements DownloadProtocol {
                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                 .build();
 
-        HttpResponse<Void> headResponse = httpClient.send(
-                headRequest, HttpResponse.BodyHandlers.discarding());
+        HttpResponse<Void> headResponse;
+        try {
+            headResponse = httpClient.send(
+                    headRequest, HttpResponse.BodyHandlers.discarding());
+        } catch (IOException e) {
+            // 首次连接阶段失败统一翻译为带主机与排查建议的错误，避免只看到笼统异常
+            throw describeConnectionError(e);
+        }
 
         if (cancelled) {
             return;
@@ -155,23 +173,56 @@ public class HttpDownloader implements DownloadProtocol {
     }
 
     private void downloadWithMultipleThreads(File saveFile, long totalSize) throws Exception {
-        // 创建文件并预分配空间
+        // 分片续传元数据侧车：记录分片参数与每个分片已完成字节数，
+        // 参数与当前任务不匹配（如换了速度策略/文件总大小变化）时整体重下
+        File metaFile = new File(saveFile.getAbsolutePath() + ".partmeta");
+        ResumeMeta resume = loadResumeMeta(metaFile, saveFile, totalSize);
+
+        int threadCount;
+        long chunkSize;
+        long[] chunkDone;
+
+        // 创建文件并预分配空间：首次下载（无有效元数据）必须截断清零，
+        // 否则同名旧文件内容会与新分片数据混杂造成损坏
         try (RandomAccessFile raf = new RandomAccessFile(saveFile, "rw")) {
-            raf.setLength(totalSize);
+            if (resume == null) {
+                raf.setLength(0);
+                raf.setLength(totalSize);
+            } else if (raf.length() != totalSize) {
+                raf.setLength(totalSize);
+            }
         }
 
-        // 先进行速度测试，确定合适的分片策略
-        long testSpeed = testConnectionSpeed();
-        int threadCount = determineThreadCount(testSpeed, totalSize);
-        long chunkSize = determineChunkSize(testSpeed, totalSize, threadCount);
+        if (resume == null) {
+            // 先进行速度测试，确定合适的分片策略（仅全新下载时测速，续传沿用旧参数）
+            long testSpeed = testConnectionSpeed();
+            threadCount = determineThreadCount(testSpeed, totalSize);
+            chunkSize = determineChunkSize(testSpeed, totalSize, threadCount);
+            chunkDone = new long[threadCount];
 
-        System.out.println("连接速度测试: " + FileUtils.formatSize(testSpeed) + "/s");
-        System.out.println("使用线程数: " + threadCount);
-        System.out.println("分片大小: " + FileUtils.formatSize(chunkSize));
+            System.out.println("连接速度测试: " + FileUtils.formatSize(testSpeed) + "/s");
+            System.out.println("使用线程数: " + threadCount);
+            System.out.println("分片大小: " + FileUtils.formatSize(chunkSize));
+        } else {
+            threadCount = resume.threadCount;
+            chunkSize = resume.chunkSize;
+            chunkDone = resume.done;
+
+            long resumed = 0;
+            for (long d : chunkDone) resumed += d;
+            System.out.println("断点续传: 线程数=" + threadCount
+                    + "，分片大小=" + FileUtils.formatSize(chunkSize)
+                    + "，已下载=" + FileUtils.formatSize(resumed));
+        }
+
+        // 分片参数确定后先落一次盘，异常退出也能保留续传上下文
+        saveResumeMeta(metaFile, totalSize, chunkSize, threadCount, chunkDone);
 
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         downloadFutures = new ArrayList<>();
-        AtomicLong downloadedTotal = new AtomicLong(0);
+        long baseline = 0;
+        for (long d : chunkDone) baseline += d;
+        AtomicLong downloadedTotal = new AtomicLong(baseline);
         AtomicInteger failedChunks = new AtomicInteger(0);
 
         try {
@@ -179,16 +230,32 @@ public class HttpDownloader implements DownloadProtocol {
                 final long start = i * chunkSize;
                 final long end = (i == threadCount - 1) ? totalSize - 1 : (i + 1) * chunkSize - 1;
                 final int threadIndex = i;
+                final long chunkLength = end - start + 1;
+                final long resumeAt = Math.min(chunkDone[i], chunkLength);
 
-                // 跳过超出文件末尾的分片
-                if (start >= totalSize) {
+                // 跳过超出文件末尾或已完整完成的分片
+                if (start >= totalSize || resumeAt >= chunkLength) {
                     continue;
                 }
 
                 Future<?> future = executor.submit(() -> {
                     try {
                         if (!cancelled) {
-                            downloadChunk(saveFile, start, end, downloadedTotal);
+                            downloadChunk(saveFile, start, end, resumeAt, downloadedTotal,
+                                    newBytes -> {
+                                        synchronized (chunkDone) {
+                                            chunkDone[threadIndex] = resumeAt + newBytes;
+                                            // 仅在分片推进时节制刷盘，避免每个块都重写元数据
+                                        }
+                                    },
+                                    () -> {
+                                        // 多个分片线程会并发推进元数据，
+                                        // 必须与 chunkDone 的更新使用同一把锁串行化读写
+                                        synchronized (chunkDone) {
+                                            saveResumeMeta(metaFile, totalSize, chunkSize,
+                                                    threadCount, chunkDone);
+                                        }
+                                    });
                         }
                     } catch (Exception e) {
                         failedChunks.incrementAndGet();
@@ -202,8 +269,8 @@ public class HttpDownloader implements DownloadProtocol {
 
             // 监控进度：只在有字节数增长时刷新活动时间，避免"零进度也刷新"导致停滞检测失效
             long lastTime = System.currentTimeMillis();
-            long lastBytes = 0;
-            long lastProgressBytes = 0;
+            long lastBytes = downloadedTotal.get();
+            long lastProgressBytes = downloadedTotal.get();
             long lastProgressTime = System.currentTimeMillis();
             while (!cancelled) {
                 boolean allDone = true;
@@ -257,6 +324,11 @@ public class HttpDownloader implements DownloadProtocol {
         long downloaded = downloadedTotal.get();
         if (downloaded < totalSize) {
             throw new IOException("分片下载不完整: " + downloaded + "/" + totalSize + " 字节");
+        }
+        // 全部完成并校验通过后删除续传元数据；
+        // 只有取消/失败时才保留，供下一次任务从断点继续
+        if (metaFile.exists() && !metaFile.delete()) {
+            System.err.println("无法删除续传元数据文件: " + metaFile.getAbsolutePath());
         }
     }
     
@@ -341,17 +413,26 @@ public class HttpDownloader implements DownloadProtocol {
     }
 
     /**
-     * 下载单个分片。任何失败都抛出异常（由调用方计数并触发统一重试），
+     * 下载单个分片（支持分片内断点：从 start+resumeAt 继续）。
+     * 任何失败都抛出异常（由调用方计数并触发统一重试），
      * 保证不完整的数据永远不会被标记为完成。
+     *
+     * @param resumeAt    该分片此前已完成的字节数
+     * @param progress    本分片本次尝试累计写入字节数的回调
+     * @param persist     持久化续传元数据的回调（按字节增量节流调用）
      */
-    private void downloadChunk(File saveFile, long start, long end, AtomicLong downloadedTotal) throws Exception {
-        long expected = end - start + 1;
+    private void downloadChunk(File saveFile, long start, long end, long resumeAt,
+                               AtomicLong downloadedTotal,
+                               java.util.function.LongConsumer progress,
+                               Runnable persist) throws Exception {
+        long requestStart = start + resumeAt;
+        long expected = end - requestStart + 1;
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
                 .header("Accept", "*/*")
-                .header("Range", "bytes=" + start + "-" + end)
+                .header("Range", "bytes=" + requestStart + "-" + end)
                 .GET()
                 .build();
 
@@ -369,20 +450,23 @@ public class HttpDownloader implements DownloadProtocol {
 
         if (response.statusCode() != 206) {
             response.body().close();
-            throw new IOException("HTTP " + response.statusCode() + "（分片请求期望 206）");
+            throw new IOException("HTTP " + response.statusCode() + "（分片续传请求期望 206）");
         }
 
         try (InputStream in = response.body();
              FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE);
              ReadableByteChannel inChannel = Channels.newChannel(in)) {
 
-            long currentPosition = start;
+            long currentPosition = requestStart;
             long transferredTotal = 0;
+            long lastPersisted = 0;
             long lastActivityTime = System.currentTimeMillis();
             long lastFlushTime = System.currentTimeMillis();
 
             while (transferredTotal < expected) {
                 if (cancelled) {
+                    // 取消时把已收字节落盘到元数据，下次可从断点继续
+                    persist.run();
                     return;
                 }
                 if (in.available() > 0) {
@@ -398,6 +482,13 @@ public class HttpDownloader implements DownloadProtocol {
                     currentPosition += transferred;
                     transferredTotal += transferred;
                     lastActivityTime = System.currentTimeMillis();
+                    progress.accept(transferredTotal);
+
+                    // 每推进约 1MB 刷一次续传元数据（崩溃最多回退 1MB）
+                    if (transferredTotal - lastPersisted >= 1024 * 1024) {
+                        persist.run();
+                        lastPersisted = transferredTotal;
+                    }
 
                     // 按照配置的间隔刷新缓冲区
                     if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
@@ -412,10 +503,19 @@ public class HttpDownloader implements DownloadProtocol {
                     Thread.sleep(10);
                 }
             }
+            // 分片完整收尾：强制落盘并标记元数据
+            fileChannel.force(true);
+            persist.run();
         }
     }
 
     private void downloadWithSingleThread(File saveFile) throws Exception {
+        // 单线程路径不使用多线程分片元数据，清掉历史残留，避免完成后留下误导性侧车
+        File staleMeta = new File(saveFile.getAbsolutePath() + ".partmeta");
+        if (staleMeta.exists()) {
+            staleMeta.delete();
+        }
+
         long start = downloadedSize;
 
         HttpRequest.Builder builder = HttpRequest.newBuilder()
@@ -515,6 +615,144 @@ public class HttpDownloader implements DownloadProtocol {
                 throw new IOException("下载不完整: " + downloaded + "/" + totalSize + " 字节");
             }
         }
+    }
+
+    /** 多线程分片续传元数据（与 .partmeta 侧车文件一一对应） */
+    private static final class ResumeMeta {
+        final long totalSize;
+        final long chunkSize;
+        final int threadCount;
+        final long[] done;
+
+        ResumeMeta(long totalSize, long chunkSize, int threadCount, long[] done) {
+            this.totalSize = totalSize;
+            this.chunkSize = chunkSize;
+            this.threadCount = threadCount;
+            this.done = done;
+        }
+    }
+
+    /**
+     * 加载并校验续传元数据。任何不一致（文件缺失/损坏、总大小或分片数对不上、
+     * 目标文件不存在或长度不符、分片进度越界）都返回 null，调用方按全新下载处理。
+     */
+    private ResumeMeta loadResumeMeta(File metaFile, File saveFile, long totalSize) {
+        if (!metaFile.exists() || !saveFile.exists() || saveFile.length() != totalSize) {
+            return null;
+        }
+        Properties props = new Properties();
+        try (FileInputStream in = new FileInputStream(metaFile)) {
+            props.load(in);
+        } catch (Exception e) {
+            return null;
+        }
+        try {
+            long metaTotal = Long.parseLong(props.getProperty("totalSize", ""));
+            long chunkSize = Long.parseLong(props.getProperty("chunkSize", ""));
+            int threadCount = Integer.parseInt(props.getProperty("threadCount", ""));
+            if (metaTotal != totalSize || chunkSize <= 0 || threadCount <= 0) {
+                return null;
+            }
+            long[] done = new long[threadCount];
+            for (int i = 0; i < threadCount; i++) {
+                long start = (long) i * chunkSize;
+                if (start >= totalSize) {
+                    // 分片数比实际可覆盖的还多，元数据与总大小不自洽
+                    return null;
+                }
+                long end = (i == threadCount - 1) ? totalSize - 1
+                        : (long) (i + 1) * chunkSize - 1;
+                long chunkLength = end - start + 1;
+                long d = Long.parseLong(props.getProperty("done." + i, ""));
+                if (d < 0 || d > chunkLength) {
+                    return null;
+                }
+                done[i] = d;
+            }
+            return new ResumeMeta(totalSize, chunkSize, threadCount, done);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 保存续传元数据（原子替换，避免崩溃时写坏侧车） */
+    private void saveResumeMeta(File metaFile, long totalSize, long chunkSize,
+                                int threadCount, long[] done) {
+        Properties props = new Properties();
+        props.setProperty("totalSize", Long.toString(totalSize));
+        props.setProperty("chunkSize", Long.toString(chunkSize));
+        props.setProperty("threadCount", Integer.toString(threadCount));
+        for (int i = 0; i < threadCount; i++) {
+            props.setProperty("done." + i, Long.toString(done[i]));
+        }
+        File tmp = new File(metaFile.getAbsolutePath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            props.store(out, "OmniFetch HTTP chunk resume metadata");
+        } catch (IOException e) {
+            // 元数据写失败不致命：最坏情况是下次从头重下，不影响本次数据正确性
+            tmp.delete();
+            System.err.println("续传元数据写入失败: " + e.getMessage());
+            return;
+        }
+        // 必须用 Files.move(REPLACE_EXISTING) 而非 File.renameTo：
+        // Windows 上 renameTo 在目标文件已存在时会失败，导致侧车只在首次写入后再不更新
+        // （分片进度永远停留在 0，分片级断点续传形同失效）
+        try {
+            Files.move(tmp.toPath(), metaFile.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            try {
+                Files.move(tmp.toPath(), metaFile.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException fallback) {
+                tmp.delete();
+                System.err.println("续传元数据替换失败: " + metaFile.getAbsolutePath());
+            }
+        } catch (IOException e) {
+            tmp.delete();
+            System.err.println("续传元数据替换失败: " + metaFile.getAbsolutePath());
+        }
+    }
+
+    /**
+     * 把连接阶段的底层异常翻译成带主机与排查建议的错误。
+     * 本机常见做法是用 hosts 把 GitHub 域名指向 127.0.0.1 的加速工具，
+     * 工具未运行或证书未受信任时，直接抛出的是笼统的 PKIX / Connection refused。
+     */
+    private IOException describeConnectionError(IOException e) {
+        String host;
+        try {
+            host = URI.create(fileURL).getHost();
+        } catch (IllegalArgumentException ignored) {
+            host = fileURL;
+        }
+        boolean handshake = false;
+        boolean refused = false;
+        boolean unknownHost = false;
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof SSLHandshakeException) {
+                handshake = true;
+            } else if (t instanceof ConnectException) {
+                refused = true;
+            } else if (t instanceof UnknownHostException) {
+                unknownHost = true;
+            }
+        }
+        String hint;
+        if (handshake) {
+            hint = "HTTPS 证书校验失败；若本机使用 GitHub 加速/代理工具，"
+                    + "请确认其证书已受信任，或改为直连（检查 hosts 与系统代理）";
+        } else if (refused) {
+            hint = "连接被拒绝；请检查 hosts 中的加速条目是否失效、"
+                    + "系统代理是否开启、防火墙是否拦截";
+        } else if (unknownHost) {
+            hint = "域名解析失败；请检查网络连接与 hosts 配置";
+        } else {
+            return e;
+        }
+        String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        return new IOException(detail + "（主机 " + host + "：" + hint + "）", e);
     }
 
     @Override

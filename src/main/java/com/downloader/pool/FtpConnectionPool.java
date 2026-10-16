@@ -103,26 +103,20 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
                     controlSocket.getOutputStream(), StandardCharsets.UTF_8), true);
             
             readResponse(220);
-            sendCommand("USER " + user, 331);
-            sendCommand("PASS " + pass, 230);
+            // 匿名 FTP 服务器可能对 USER 直接回 230（已登录），此时不需要再发 PASS
+            int userCode = sendCommand("USER " + user, 230, 331);
+            if (userCode == 331) {
+                sendCommand("PASS " + pass, 230);
+            }
             sendCommand("TYPE I", 200);
         }
-        
+
         /**
-         * 发送命令并等待响应
+         * 发送命令并等待响应，返回最终响应码；不在接受列表内时抛异常（不再静默返回）
          */
-        public void sendCommand(String cmd, int expectedCode) throws IOException {
+        public int sendCommand(String cmd, int... acceptedCodes) throws IOException {
             controlOut.println(cmd);
-            String line;
-            while ((line = controlIn.readLine()) != null) {
-                if (line.length() >= 3) {
-                    int code = Integer.parseInt(line.substring(0, 3));
-                    if (code == expectedCode) return;
-                    if (code >= 400) throw new IOException("FTP error: " + line);
-                }
-                if (line.length() > 3 && line.charAt(3) == '-') continue;
-                break;
-            }
+            return readResponse(acceptedCodes);
         }
         
         /**
@@ -136,19 +130,43 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
         }
         
         /**
-         * 读取响应
+         * 读取一条（可能多行的）FTP 响应，返回最终响应码；
+         * 不在接受列表内的最终码一律抛异常，避免上层在错误状态下继续操作
          */
-        public void readResponse(int expectedCode) throws IOException {
-            String line;
+        public int readResponse(int... acceptedCodes) throws IOException {
+            String line = null;
+            String finalLine = null;
+            int code = -1;
             while ((line = controlIn.readLine()) != null) {
-                if (line.length() >= 3) {
-                    int code = Integer.parseInt(line.substring(0, 3));
-                    if (code == expectedCode) return;
-                    if (code >= 400) throw new IOException("FTP error: " + line);
+                if (line.length() < 4) {
+                    continue;
                 }
-                if (line.length() > 3 && line.charAt(3) == '-') continue;
+                int parsed;
+                try {
+                    parsed = Integer.parseInt(line.substring(0, 3));
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                if (line.charAt(3) == '-') {
+                    // 多行响应的续行（形如 "220-Welcome ..."）
+                    continue;
+                }
+                // 第 4 位为空格（或无续行标记）即为最终响应行
+                code = parsed;
+                finalLine = line;
                 break;
             }
+            if (finalLine == null) {
+                throw new IOException("FTP 服务器关闭了连接或未返回响应");
+            }
+            for (int accepted : acceptedCodes) {
+                if (code == accepted) {
+                    return code;
+                }
+            }
+            throw new IOException("FTP 响应码异常（期望 "
+                    + java.util.Arrays.toString(acceptedCodes)
+                    + "，实际 " + code + "）: " + finalLine);
         }
         
         /**

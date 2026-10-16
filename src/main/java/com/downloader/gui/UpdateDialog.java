@@ -315,6 +315,21 @@ final class UpdateDialog extends JDialog {
             setState(State.COMPLETED);
             return;
         }
+        // 已存在但大小不匹配的安装包是上次遗留的坏文件：
+        // UpdateDownloader.start() 见到最终文件存在会直接返回，
+        // 不先删除会导致界面进入 DOWNLOADING 却永远没有进度。
+        // 同时清掉可能属于旧版本的 .part，避免把新内容追加到旧断点上。
+        if (installerFile.exists() && !installerFile.delete()) {
+            status("无法覆盖已存在的安装包文件：" + installerFile.getAbsolutePath(),
+                    MainWindow.DANGER);
+            return;
+        }
+        File stalePart = new File(installerFile.getAbsolutePath() + ".part");
+        if (stalePart.exists() && !stalePart.delete()) {
+            status("无法清理旧的下载临时文件：" + stalePart.getAbsolutePath(),
+                    MainWindow.DANGER);
+            return;
+        }
         progressBar.setIndeterminate(false);
         downloader = new UpdateDownloader(asset.downloadUrl, installerFile, new UpdateDownloader.Listener() {
             @Override

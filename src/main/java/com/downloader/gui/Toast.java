@@ -54,10 +54,11 @@ final class Toast {
         layer.toast(text, accent, icon);
     }
 
-    /** 玻璃层：自身不拦截鼠标（区域外点击穿透），仅 Toast 视图拦截 */
+    /** 玻璃层：区域外点击穿透，Toast 视图范围内拦截鼠标（避免误触下层控件） */
     private static final class Layer extends JComponent {
 
         private Timer dismissTimer;
+        private View activeView;
 
         Layer() {
             setLayout(null);
@@ -66,6 +67,7 @@ final class Toast {
         void toast(String text, Color accent, Icon icon) {
             // 重置：取消上一次未完成的消失流程
             removeAll();
+            activeView = null;
             if (dismissTimer != null) {
                 dismissTimer.stop();
             }
@@ -87,11 +89,14 @@ final class Toast {
                 view.repaint();
             });
 
+            activeView = view;
+
             // 停留后淡出
             dismissTimer = new Timer(HOLD_MS, e -> {
                 dismissTimer.stop();
                 UiAnim.animate(FADE_OUT_MS, t -> view.alpha = 1 - t, () -> {
                     removeAll();
+                    activeView = null;
                     setVisible(false);
                 });
             });
@@ -99,10 +104,15 @@ final class Toast {
             dismissTimer.start();
         }
 
-        /** 玻璃层不包含任何点 → 鼠标事件穿透到下层组件 */
+        /**
+         * 只有点击落在当前 Toast 视图范围内才由玻璃层（及其子组件）接收，
+         * 其余位置返回 false 让事件穿透到下层；
+         * 恒返回 false 会让子 View 永远收不到鼠标事件。
+         */
         @Override
         public boolean contains(int x, int y) {
-            return false;
+            View v = activeView;
+            return v != null && v.getBounds().contains(x, y);
         }
     }
 

@@ -62,6 +62,8 @@ public final class UpdateDownloader {
     private volatile boolean cancelRequested;
     private volatile long downloaded;
     private volatile long total = -1;
+    /** 当前在途连接：取消时主动 disconnect，避免阻塞读不响应 interrupt 而干等读超时 */
+    private volatile HttpURLConnection activeConn;
 
     public UpdateDownloader(String fileUrl, File finalFile, Listener listener) {
         this.fileUrl = fileUrl;
@@ -101,6 +103,11 @@ public final class UpdateDownloader {
         if (w != null) {
             w.interrupt();
         }
+        // HttpURLConnection 的阻塞 read 不保证响应中断，主动断开连接立即解除阻塞
+        HttpURLConnection c = activeConn;
+        if (c != null) {
+            c.disconnect();
+        }
     }
 
     private synchronized void spawnWorker() {
@@ -126,6 +133,7 @@ public final class UpdateDownloader {
             int redirects = 0;
             while (true) {
                 conn = openConnection(currentUrl, existing);
+                activeConn = conn;
                 try {
                     code = conn.getResponseCode();
                 } catch (java.io.IOException e) {
@@ -135,6 +143,7 @@ public final class UpdateDownloader {
                     String location = conn.getHeaderField("Location");
                     conn.disconnect();
                     conn = null;
+                    activeConn = null;
                     if (location == null || location.isBlank()) {
                         throw new java.io.IOException("服务器重定向响应缺少 Location 头");
                     }
@@ -201,6 +210,7 @@ public final class UpdateDownloader {
             } finally {
                 conn.disconnect();
                 conn = null;
+                activeConn = null;
             }
 
             if (cancelRequested) {
@@ -228,6 +238,8 @@ public final class UpdateDownloader {
         } catch (Exception e) {
             if (conn != null) {
                 conn.disconnect();
+                conn = null;
+                activeConn = null;
             }
             if (cancelRequested) {
                 if (partFile.exists() && !partFile.delete()) {

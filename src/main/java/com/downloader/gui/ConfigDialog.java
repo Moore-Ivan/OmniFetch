@@ -2,7 +2,6 @@ package com.downloader.gui;
 
 import com.downloader.config.ConfigManager;
 import com.downloader.config.ConfigManager.ConfigItem;
-import com.downloader.config.ConfigManager.ConfigType;
 
 import javax.swing.*;
 import javax.swing.border.LineBorder;
@@ -189,11 +188,14 @@ public class ConfigDialog extends JDialog {
         switch (item.type) {
             case NUMBER -> {
                 long current = parseClamped(item, configManager.getString(item.key, item.defaultValue));
-                // 注意：四个 long 实参命中 SpinnerNumberModel(double,...) 重载（宽化优先于装箱），
-                // 模型值为 Double，取值时必须按 Number.longValue() 转换（见 save()），
-                // 不能直接 toString 后 Long.parseLong（"5.0" 会解析失败）
+                // 显式装箱为 Long，命中 (Number, Comparable, Number, Number) 构造，
+                // 模型值为 Long：步进为整数、输入小数时 commitEdit 直接失败并在 save() 提示。
+                // （切勿传四个 long 实参——会宽化命中 double 重载导致模型变成 Double。）
                 SpinnerNumberModel model = new SpinnerNumberModel(
-                        current, item.min, item.max, item.step);
+                        Long.valueOf(current),
+                        Long.valueOf(item.min),
+                        Long.valueOf(item.max),
+                        Long.valueOf(item.step));
                 JSpinner spinner = new JSpinner(model);
                 // 整数显示，带千分位分隔符，大数字更易读
                 JSpinner.NumberEditor editor = new JSpinner.NumberEditor(spinner, "#,###");
@@ -368,8 +370,8 @@ public class ConfigDialog extends JDialog {
 
     private void resetToDefaults() {
         for (Map.Entry<ConfigItem, JSpinner> entry : spinners.entrySet()) {
-            // 模型为 Double 类型（见 addItemRow），传 Long 会与边界比较时 ClassCastException
-            entry.getValue().setValue((double) entry.getKey().getDefaultAsLong());
+            // 模型为 Long 类型（见 addItemRow），恢复默认也必须传 Long
+            entry.getValue().setValue(entry.getKey().getDefaultAsLong());
         }
         for (Map.Entry<ConfigItem, JCheckBox> entry : checkBoxes.entrySet()) {
             entry.getValue().setSelected(Boolean.parseBoolean(entry.getKey().defaultValue));
