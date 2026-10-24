@@ -1986,7 +1986,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                         <div class="info-icon"><i class="fas fa-envelope"></i></div>
                         <div class="info-body">
                             <div class="info-label">Email</div>
-                            <div class="info-value"><a href="mailto:Qianhe_Ivan@outlook.com">Qianhe_Ivan@outlook.com</a></div>
+                            <div class="info-value"><a href="mailto:Moore_Ivan@foxmail.com">Moore_Ivan@foxmail.com</a></div>
                         </div>
                     </div>
                 </div>
