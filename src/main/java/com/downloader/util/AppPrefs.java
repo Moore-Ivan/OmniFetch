@@ -57,7 +57,7 @@ public final class AppPrefs {
         try {
             PREFS.flush();
         } catch (BackingStoreException e) {
-            System.err.println("保存主题偏好失败: " + e.getMessage());
+            AppLogger.warn("保存主题偏好失败: " + e.getMessage());
         }
     }
 }

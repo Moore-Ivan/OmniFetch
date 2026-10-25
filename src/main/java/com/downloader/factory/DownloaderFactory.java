@@ -5,6 +5,7 @@ import com.downloader.model.ProgressCallback;
 import com.downloader.plugin.PluginManager;
 import com.downloader.protocol.*;
 import com.downloader.util.FileUtils;
+import com.downloader.util.RateLimiter;
 
 /**
  * 下载器工厂：根据协议类型创建对应的 DownloadProtocol 实例
@@ -20,14 +21,15 @@ public final class DownloaderFactory {
                                            String pass,
                                            ProgressCallback callback,
                                            long downloadedSize,
-                                           String saveFilePath)
+                                           String saveFilePath,
+                                           RateLimiter limiter)
             throws Exception {
-        
+
         // 首先尝试使用插件处理
         PluginManager pluginManager = PluginManager.getInstance();
         DownloadProtocol downloader = pluginManager.createDownloader(
                 url, savePath, user, pass, callback, downloadedSize, saveFilePath);
-        
+
         if (downloader != null) {
             return downloader;
         }
@@ -36,7 +38,7 @@ public final class DownloaderFactory {
         switch (protocol) {
 
             case HTTP_HTTPS:
-                return new HttpDownloader(url, savePath, callback, downloadedSize, saveFilePath);
+                return new HttpDownloader(url, savePath, callback, downloadedSize, saveFilePath, limiter);
 
             case FTP: {
                 String host = FileUtils.extractHost(url);
@@ -48,7 +50,7 @@ public final class DownloaderFactory {
                         ? pass : FileUtils.extractPass(url, "");
                 String path = FileUtils.extractPath(url);
                 return new FtpDownloader(host, port, u, p, path,
-                        savePath, callback);
+                        savePath, callback, saveFilePath, limiter);
             }
 
             case SFTP: {
@@ -60,20 +62,33 @@ public final class DownloaderFactory {
                         ? pass : FileUtils.extractPass(url, "");
                 String path = FileUtils.extractPath(url);
                 return new SftpDownloader(host, port, u, p, path,
-                        savePath, callback);
+                        savePath, callback, saveFilePath, limiter);
             }
 
             case M3U8_HLS:
-                return new M3u8Downloader(url, savePath, callback);
+                return new M3u8Downloader(url, savePath, callback, limiter);
 
             case MAGNET:
             case TORRENT:
-                return new BitTorrentDownloader(url, savePath, callback);
+                // saveFilePath：续传/重试时复用上次实际落盘路径，避免重下生成新文件名
+                return new BitTorrentDownloader(url, savePath, callback, saveFilePath, limiter);
 
             default:
                 throw new UnsupportedOperationException(
                         "不支持的协议: " + protocol.displayName);
         }
+    }
+
+    public static DownloadProtocol create(Protocol protocol,
+                                           String url,
+                                           String savePath,
+                                           String user,
+                                           String pass,
+                                           ProgressCallback callback,
+                                           long downloadedSize,
+                                           String saveFilePath)
+            throws Exception {
+        return create(protocol, url, savePath, user, pass, callback, downloadedSize, saveFilePath, null);
     }
 
     public static DownloadProtocol create(Protocol protocol,

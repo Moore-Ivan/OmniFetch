@@ -1,6 +1,7 @@
 package com.downloader;
 
 import com.downloader.gui.MainWindow;
+import com.downloader.util.AppLogger;
 import com.downloader.util.AppPrefs;
 import com.downloader.util.AppPrefs.ThemeMode;
 import com.downloader.util.OsTheme;
@@ -56,7 +57,7 @@ public class Main {
         try {
             UIManager.setLookAndFeel(dark ? new FlatDarkLaf() : new FlatLightLaf());
         } catch (javax.swing.UnsupportedLookAndFeelException e) {
-            System.err.println("设置主题失败: " + e.getMessage());
+            AppLogger.warn("设置主题失败: " + e.getMessage());
         }
     }
 }

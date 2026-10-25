@@ -7,10 +7,12 @@ import com.downloader.event.EventBus;
 import com.downloader.manager.DownloadManager;
 import com.downloader.model.DownloadTask;
 import com.downloader.model.Protocol;
+import com.downloader.util.AppLogger;
 import com.downloader.util.AppPrefs;
 import com.downloader.util.FileUtils;
 import com.downloader.util.InstallerLauncher;
 import com.downloader.util.OsTheme;
+import com.downloader.util.RateLimiter;
 import com.downloader.util.UpdateChecker;
 import com.downloader.util.VersionInfo;
 
@@ -25,6 +27,7 @@ import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
+import javax.swing.JMenu;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -108,7 +111,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     // --- UI 组件 ---
     private JTextField urlField;
-    private JTextField pathField;
+    private JLabel pathLabel;
     private JTextField userField;
     private JPasswordField passField;
     private BadgeLabel protocolBadge;
@@ -143,10 +146,6 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private boolean darkMode = Main.resolveDark(themeMode);
     private boolean credsShown = false;
     private Protocol detectedProtocol;
-    /** 主界面保存路径是否被用户手动修改过（未修改时跟随配置中的"默认保存路径"自动同步） */
-    private boolean pathFieldEdited = false;
-    /** 程序化同步路径输入框时抑制"用户已编辑"标记（区分用户输入与代码 setText） */
-    private boolean syncingPath = false;
     /** 剪贴板下载链接监视器（是否启用与间隔均由高级配置控制） */
     private ClipboardMonitor clipboardMonitor;
     /** 剪贴板确认对话框正在显示，防止重复弹窗 */
@@ -211,23 +210,17 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     /**
-     * 订阅配置变更：高级配置中保存"默认保存路径"（或外部编辑配置文件）后，
-     * 若用户未在主界面手动改过保存路径，则即时同步显示，
-     * 避免"配置已保存但主界面仍是旧路径"；用户手动改过则保留其选择不被覆盖。
+     * 订阅配置变更：高级配置中保存"保存路径"（或主界面「浏览…」/外部编辑配置文件）后，
+     * 即时同步主界面显示，避免"配置已保存但主界面仍是旧路径"。
      * 事件可能来自配置文件监视器线程，统一切回 EDT 更新组件。
      */
     private void registerConfigSync() {
         EventBus.getInstance().registerConfigChangeListener(event ->
                 EventQueue.invokeLater(() -> {
-                    if (pathField == null || pathFieldEdited) {
+                    if (pathLabel == null) {
                         return;
                     }
-                    syncingPath = true;
-                    try {
-                        pathField.setText(resolveDefaultSaveDir());
-                    } finally {
-                        syncingPath = false;
-                    }
+                    setPathDisplay(resolveDefaultSaveDir());
                 }));
     }
 
@@ -258,7 +251,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     /**
-     * 剪贴板中发现下载链接：确认后直接加入队列，保存到配置的默认保存路径。
+     * 剪贴板中发现下载链接：确认后直接加入队列，保存到配置的保存路径。
      * 回调运行在 EDT（Swing Timer）上，可直接操作界面。
      */
     private void onClipboardLink(String url) {
@@ -280,8 +273,13 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                     "在剪贴板中发现下载链接：\n" + display + "\n\n是否立即开始下载？",
                     "发现下载链接", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
             if (choice == JOptionPane.OK_OPTION) {
-                downloadManager.addTask(url, resolveDefaultSaveDir(), "", "");
-                Toast.success(this, "下载任务已添加");
+                try {
+                    downloadManager.addTask(url, resolveDefaultSaveDir(), "", "");
+                    Toast.success(this, "下载任务已添加");
+                } catch (IllegalStateException ex) {
+                    // 有界队列满时 addTask 明确抛错，必须反馈而非让 EDT 静默吞掉
+                    Toast.error(this, ex.getMessage());
+                }
             }
         } finally {
             clipboardPromptShowing = false;
@@ -316,9 +314,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
      * 路径为空时提示；路径是普通文件时警告；目录不存在时询问是否创建后打开。
      */
     private void openPathDirectory() {
-        String text = pathField.getText().trim();
+        String text = pathLabel.getText().trim();
         if (text.isEmpty()) {
-            pathField.putClientProperty("JComponent.outline", "error");
             Toast.warning(this, "保存路径为空");
             return;
         }
@@ -411,7 +408,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
                 }
             }
         } catch (Exception e) {
-            System.err.println("加载窗口图标失败: " + e.getMessage());
+            AppLogger.warn("加载窗口图标失败: " + e.getMessage());
         }
         return null;
     }
@@ -683,10 +680,11 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     /**
-     * 解析配置中的"默认保存路径"为绝对路径：
+     * 解析配置中的"保存路径"为绝对路径：
      * 空值（旧配置升级）兜底为程序根目录/downloads；相对路径按程序根目录解析。
+     * 包可见供 ConfigDialog 显示实际保存路径（ConfigManager 包在 config 包，无法反向依赖 gui）。
      */
-    private static String resolveDefaultSaveDir() {
+    static String resolveDefaultSaveDir() {
         String dir = ConfigManager.getInstance()
                 .getString("download.defaultSaveDir", "").trim();
         if (dir.isEmpty()) {
@@ -695,6 +693,28 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         File f = new File(dir);
         return f.isAbsolute() ? f.getAbsolutePath()
                 : new File(System.getProperty("user.dir"), dir).getAbsolutePath();
+    }
+
+    /**
+     * 主界面「浏览…」选择新目录后写回配置（下载配置 → 保存路径）并热加载生效。
+     * 仅传该键，其余配置项由 saveConfig 保留现值；显示经配置变更事件同步刷新。
+     */
+    private void updateDefaultSaveDir(String absolutePath) {
+        try {
+            ConfigManager.getInstance()
+                    .saveConfig(Map.of("download.defaultSaveDir", absolutePath));
+            setPathDisplay(resolveDefaultSaveDir());
+            Toast.success(this, "保存路径已更新：" + absolutePath);
+        } catch (Exception ex) {
+            AppLogger.warn("保存路径写入配置失败: " + ex.getMessage());
+            Toast.error(this, "保存路径更新失败：" + ex.getMessage());
+        }
+    }
+
+    /** 更新主界面保存路径显示（纯展示标签，tooltip 同步完整路径防止过长被裁切） */
+    private void setPathDisplay(String path) {
+        pathLabel.setText(path);
+        pathLabel.setToolTipText(path);
     }
 
     private JLabel createHintLabel(String text) {
@@ -726,29 +746,26 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
         JLabel l = createHintLabel("保存路径");
 
-        // 输入框占满剩余宽度（CENTER），右侧仅固定空出"浏览…/打开"按钮的位置
+        // 标签占满剩余宽度（CENTER），右侧仅固定空出"浏览…/打开"按钮的位置
         JPanel row = new JPanel(new BorderLayout(8, 0));
 
-        // 初始值：取配置的"默认保存路径"（空值/旧配置兜底为程序根目录下 downloads，
-        // 相对路径按程序根目录解析为绝对路径，所见即所得）；目录在首次下载时自动创建
-        pathField = new JTextField(resolveDefaultSaveDir());
-        onTextChange(pathField, () -> {
-            if (!syncingPath) {
-                pathFieldEdited = true;
-            }
-            pathField.putClientProperty("JComponent.outline", null);
-        });
+        // 纯展示标签（非文本框）：显示配置中的"保存路径"（单一事实来源在配置文件），
+        // 空值/旧配置兜底为程序根目录下 downloads，相对路径按程序根目录解析为绝对路径；目录在首次下载时自动创建
+        pathLabel = new JLabel();
+        setPathDisplay(resolveDefaultSaveDir());
 
         browseBtn = new JButton("浏览…", UiIcons.folder());
         browseBtn.setFocusable(false);
         browseBtn.setPreferredSize(new Dimension(96, browseBtn.getPreferredSize().height));
+        browseBtn.setToolTipText("选择新的保存目录，写回配置并即时生效");
         browseBtn.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();
+            chooser.setDialogTitle("选择保存路径");
             chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-            chooser.setCurrentDirectory(new File(pathField.getText()));
+            chooser.setCurrentDirectory(new File(pathLabel.getText()));
             int result = chooser.showOpenDialog(this);
             if (result == JFileChooser.APPROVE_OPTION) {
-                pathField.setText(chooser.getSelectedFile().getAbsolutePath());
+                updateDefaultSaveDir(chooser.getSelectedFile().getAbsolutePath());
             }
         });
 
@@ -763,7 +780,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         btnGroup.add(browseBtn);
         btnGroup.add(openBtn);
 
-        row.add(pathField, BorderLayout.CENTER);
+        row.add(pathLabel, BorderLayout.CENTER);
         row.add(btnGroup, BorderLayout.EAST);
 
         panel.add(l);
@@ -1048,7 +1065,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     private void addTask() {
         final String url  = urlField.getText().trim();
-        final String path = pathField.getText().trim();
+        final String path = pathLabel.getText().trim();
         final String user = userField.getText().trim();
         final String pass = new String(passField.getPassword()).trim();
 
@@ -1058,7 +1075,6 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             return;
         }
         if (path.isEmpty()) {
-            pathField.putClientProperty("JComponent.outline", "error");
             Toast.warning(this, "请选择保存路径");
             return;
         }
@@ -1070,7 +1086,13 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             return;
         }
 
-        downloadManager.addTask(url, path, user, pass);
+        try {
+            downloadManager.addTask(url, path, user, pass);
+        } catch (IllegalStateException ex) {
+            // 队列已满等明确失败：保留输入内容便于用户清理后重试
+            Toast.error(this, ex.getMessage());
+            return;
+        }
         urlField.setText(""); // 触发 detectProtocol 重置输入框反馈
         Toast.success(this, "下载任务已添加");
     }
@@ -1116,8 +1138,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
      */
     private boolean ensureCredentials(DownloadTask task) {
         Protocol protocol = task.getProtocol();
+        // anonymous 无需密码（工厂对 FTP 回退 anonymous），弹框只会困扰用户
         boolean needPassword = (protocol == Protocol.FTP || protocol == Protocol.SFTP)
                 && task.getUsername() != null && !task.getUsername().isBlank()
+                && !"anonymous".equalsIgnoreCase(task.getUsername())
                 && (task.getPassword() == null || task.getPassword().isEmpty());
         if (!needPassword) {
             return true;
@@ -1244,10 +1268,70 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             default -> { }
         }
 
+        // 限速子菜单：任意状态可预设，下载中的任务改动即时生效
+        menu.add(buildSpeedLimitMenu(task));
+
         JMenuItem deleteItem = new JMenuItem("删除任务", UiIcons.delete());
         deleteItem.addActionListener(e -> downloadManager.removeTask(task.getId()));
         menu.add(deleteItem);
         return menu;
+    }
+
+    /** 构建单任务限速子菜单：跟随全局(0) / 不限速(-1) / 预设档位 */
+    private JMenu buildSpeedLimitMenu(DownloadTask task) {
+        JMenu limitMenu = new JMenu("限速");
+        ButtonGroup group = new ButtonGroup();
+        long current = task.getSpeedLimitBps();
+
+        JRadioButtonMenuItem followItem =
+                new JRadioButtonMenuItem("跟随全局设置", current == 0);
+        followItem.addActionListener(e -> applyTaskSpeedLimit(task, 0));
+        group.add(followItem);
+        limitMenu.add(followItem);
+
+        JRadioButtonMenuItem unlimitedItem =
+                new JRadioButtonMenuItem("不限速", current < 0);
+        unlimitedItem.addActionListener(e -> applyTaskSpeedLimit(task, -1));
+        group.add(unlimitedItem);
+        limitMenu.add(unlimitedItem);
+
+        long[] presets = {512L * 1024, 1024L * 1024, 2L * 1024 * 1024,
+                5L * 1024 * 1024, 10L * 1024 * 1024};
+        for (long bps : presets) {
+            JRadioButtonMenuItem item =
+                    new JRadioButtonMenuItem(formatSpeedLabel(bps), current == bps);
+            item.addActionListener(e -> applyTaskSpeedLimit(task, bps));
+            group.add(item);
+            limitMenu.add(item);
+        }
+        return limitMenu;
+    }
+
+    /** 应用单任务限速：下载中的任务同步调整令牌桶，立即生效 */
+    private void applyTaskSpeedLimit(DownloadTask task, long bps) {
+        task.setSpeedLimitBps(bps);
+        long effective = downloadManager.resolveSpeedLimitBps(task);
+        RateLimiter limiter = task.getRateLimiter();
+        if (limiter != null) {
+            limiter.setLimitBytesPerSec(effective);
+        }
+        String text;
+        if (bps > 0) {
+            text = "已限速 " + formatSpeedLabel(bps);
+        } else if (bps == 0) {
+            text = effective > 0
+                    ? "跟随全局限速 " + formatSpeedLabel(effective)
+                    : "跟随全局设置（当前不限速）";
+        } else {
+            text = "已取消单任务限速";
+        }
+        Toast.info(this, text);
+    }
+
+    /** 字节/秒 → 可读速度标签（512KB/s、1 MB/s…） */
+    private static String formatSpeedLabel(long bps) {
+        long kb = bps / 1024;
+        return kb % 1024 == 0 ? (kb / 1024) + " MB/s" : kb + " KB/s";
     }
 
     /** 打开已完成的文件（复用 InstallerLauncher 的多级回退，exe 也可正常启动） */
@@ -2156,17 +2240,28 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     @Override
     public void onTaskAdded(DownloadTask task) {
-        EventQueue.invokeLater(() -> refreshTimer.restart());
+        EventQueue.invokeLater(this::scheduleRefresh);
     }
 
     @Override
     public void onTaskUpdated(DownloadTask task) {
-        EventQueue.invokeLater(() -> refreshTimer.restart());
+        EventQueue.invokeLater(this::scheduleRefresh);
     }
 
     @Override
     public void onTaskRemoved(String taskId) {
-        EventQueue.invokeLater(() -> refreshTimer.restart());
+        EventQueue.invokeLater(this::scheduleRefresh);
+    }
+
+    /**
+     * 合并节流的关键：Timer.restart() 在运行中会重置倒计时，若事件到达间隔
+     * 短于刷新间隔（如多任务高频进度回调），定时器将永远无法触发（饥饿）。
+     * 仅在未运行时才启动，运行中的刷新按既有节奏执行。
+     */
+    private void scheduleRefresh() {
+        if (!refreshTimer.isRunning()) {
+            refreshTimer.restart();
+        }
     }
 
     /**
@@ -2314,22 +2409,22 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     //  渲染器
     // ══════════════════════════════════════════
 
-    /** 进度列：FlatLaf 圆角进度条 + 百分比 */
+    /**
+     * 进度列：FlatLaf 圆角进度条，百分比字符串绘制在进度条内部（setStringPainted）。
+     * 填充区/未填充区的文字对比色由 FlatLaf 按亮暗主题自动计算（ProgressBar.selectionForeground/Background），
+     * 无需手动适配主题。
+     */
     private class ProgressTableCellRenderer extends DefaultTableCellRenderer {
-        final JPanel content = new JPanel(new BorderLayout(8, 0));
+        final JPanel content = new JPanel(new BorderLayout());
         private final JProgressBar progressBar;
-        private final JLabel progressLabel;
 
         ProgressTableCellRenderer() {
             progressBar = new JProgressBar(0, 100);
-            progressBar.setPreferredSize(new Dimension(100, 12));
-
-            progressLabel = new JLabel();
-            progressLabel.setHorizontalAlignment(SwingConstants.CENTER);
-            progressLabel.setPreferredSize(new Dimension(44, 12));
+            progressBar.setStringPainted(true);
+            // 高度略增保证内部文字可读（行高 40 足够），宽度占满单元格
+            progressBar.setPreferredSize(new Dimension(120, 18));
 
             content.add(progressBar, BorderLayout.CENTER);
-            content.add(progressLabel, BorderLayout.EAST);
             content.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
         }
 
@@ -2337,12 +2432,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
             if (value instanceof Integer progress) {
                 progressBar.setValue(progress);
-                progressLabel.setText(progress + "%");
-
                 content.setBackground(isSelected ? table.getSelectionBackground() : table.getBackground());
-                progressLabel.setForeground(isSelected
-                        ? table.getSelectionForeground()
-                        : UIManager.getColor("Label.foreground"));
                 return content;
             }
             return super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);

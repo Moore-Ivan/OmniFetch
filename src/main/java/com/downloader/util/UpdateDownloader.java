@@ -82,9 +82,14 @@ public final class UpdateDownloader {
         spawnWorker();
     }
 
-    /** 请求暂停：当前连接读完一个缓冲块后停止，已下载内容保留。 */
+    /** 请求暂停：断开在途连接让读取循环立即退出，已下载内容保留在 part 文件中。 */
     public synchronized void pause() {
         pauseRequested = true;
+        // 阻塞 read 最长要等满读超时（30 秒）才醒来，主动断开连接立即解除阻塞
+        HttpURLConnection c = activeConn;
+        if (c != null) {
+            c.disconnect();
+        }
     }
 
     /** 从断点继续下载。 */
@@ -108,6 +113,18 @@ public final class UpdateDownloader {
         if (c != null) {
             c.disconnect();
         }
+        if (w == null) {
+            // 无在途 worker（暂停态/未启动）：没有人会回报结果，直接清理并通知
+            deletePartFile();
+            listener.onCancelled();
+        }
+    }
+
+    /** 删除临时文件（清理失败仅记录，不阻塞回调流程） */
+    private void deletePartFile() {
+        if (partFile.exists() && !partFile.delete()) {
+            AppLogger.warn("取消下载后无法删除临时文件: " + partFile.getAbsolutePath());
+        }
     }
 
     private synchronized void spawnWorker() {
@@ -124,59 +141,85 @@ public final class UpdateDownloader {
             long existing = partFile.exists() ? partFile.length() : 0;
             downloaded = existing;
 
-            // 手动跟随重定向：GitHub 资产会 302 到 objects.githubusercontent.com。
-            // 不用自动跟随的原因：
-            // 1) 自动跟随打开的新连接不会继承 HttpTrust 的信任配置（精简 JRE cacerts 不全时重定向后 PKIX）；
-            // 2) 手动跟随可在连接被拒时指出具体主机（hosts 失效/代理未开/防火墙的排查依据）
-            String currentUrl = fileUrl;
-            int code;
-            int redirects = 0;
-            while (true) {
-                conn = openConnection(currentUrl, existing);
-                activeConn = conn;
-                try {
-                    code = conn.getResponseCode();
-                } catch (java.io.IOException e) {
-                    throw enrichConnectionError(currentUrl, e);
+            // 外层最多两轮：发现 part 文件与服务器内容不匹配（416）时删除重试一次
+            for (int attempt = 0; ; attempt++) {
+                // 手动跟随重定向：GitHub 资产会 302 到 objects.githubusercontent.com。
+                // 不用自动跟随的原因：
+                // 1) 自动跟随打开的新连接不会继承 HttpTrust 的信任配置（精简 JRE cacerts 不全时重定向后 PKIX）；
+                // 2) 手动跟随可在连接被拒时指出具体主机（hosts 失效/代理未开/防火墙的排查依据）
+                String currentUrl = fileUrl;
+                int code;
+                int redirects = 0;
+                while (true) {
+                    conn = openConnection(currentUrl, existing);
+                    activeConn = conn;
+                    try {
+                        code = conn.getResponseCode();
+                    } catch (java.io.IOException e) {
+                        throw enrichConnectionError(currentUrl, e);
+                    }
+                    if (code >= 300 && code < 400) {
+                        String location = conn.getHeaderField("Location");
+                        conn.disconnect();
+                        conn = null;
+                        activeConn = null;
+                        if (location == null || location.isBlank()) {
+                            throw new java.io.IOException("服务器重定向响应缺少 Location 头");
+                        }
+                        if (redirects++ >= 10) {
+                            throw new java.io.IOException("重定向次数过多（超过 10 次）");
+                        }
+                        currentUrl = URI.create(currentUrl).resolve(location).toString();
+                        String lower = currentUrl.toLowerCase(java.util.Locale.ROOT);
+                        if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
+                            throw new java.io.IOException("重定向地址协议不受支持：" + currentUrl);
+                        }
+                        continue;
+                    }
+                    break;
                 }
-                if (code >= 300 && code < 400) {
-                    String location = conn.getHeaderField("Location");
+
+                if (code == 206) {
+                    // 断点续传：优先从 Content-Range 取总大小
+                    total = parseTotalFromContentRange(conn.getHeaderField("Content-Range"));
+                    if (total <= 0) {
+                        long contentLength = conn.getContentLengthLong();
+                        total = contentLength > 0 ? existing + contentLength : -1;
+                    }
+                } else if (code == 200) {
+                    // 服务器不支持 Range（或无 part 文件）：从头下载
+                    if (existing > 0 && !partFile.delete()) {
+                        throw new java.io.IOException("无法重置临时文件：" + partFile.getAbsolutePath());
+                    }
+                    existing = 0;
+                    downloaded = 0;
+                    total = conn.getContentLengthLong();
+                } else if (code == 416 && attempt == 0) {
+                    // Range 起点越界：part 文件比服务器当前内容还大（如换版本后总大小变化）。
+                    // 与服务器总长一致说明上次实际已下载完整，直接收尾；否则删除残缺 part 重试一次
+                    long remoteTotal = parseTotalFromContentRange(
+                            conn.getHeaderField("Content-Range"));
                     conn.disconnect();
                     conn = null;
                     activeConn = null;
-                    if (location == null || location.isBlank()) {
-                        throw new java.io.IOException("服务器重定向响应缺少 Location 头");
+                    if (remoteTotal > 0 && existing == remoteTotal) {
+                        total = remoteTotal;
+                        completeRename();
+                        listener.onProgress(downloaded, total, 0);
+                        listener.onComplete(finalFile);
+                        return;
                     }
-                    if (redirects++ >= 10) {
-                        throw new java.io.IOException("重定向次数过多（超过 10 次）");
+                    if (partFile.exists() && !partFile.delete()) {
+                        throw new java.io.IOException("无法重置临时文件：" + partFile.getAbsolutePath());
                     }
-                    currentUrl = URI.create(currentUrl).resolve(location).toString();
-                    String lower = currentUrl.toLowerCase(java.util.Locale.ROOT);
-                    if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
-                        throw new java.io.IOException("重定向地址协议不受支持：" + currentUrl);
-                    }
+                    existing = 0;
+                    downloaded = 0;
+                    total = -1;
                     continue;
+                } else {
+                    throw new java.io.IOException("服务器返回异常状态码：" + code);
                 }
-                break;
-            }
-
-            if (code == 206) {
-                // 断点续传：优先从 Content-Range 取总大小
-                total = parseTotalFromContentRange(conn.getHeaderField("Content-Range"));
-                if (total <= 0) {
-                    long contentLength = conn.getContentLengthLong();
-                    total = contentLength > 0 ? existing + contentLength : -1;
-                }
-            } else if (code == 200) {
-                // 服务器不支持 Range（或无 part 文件）：从头下载
-                if (existing > 0 && !partFile.delete()) {
-                    throw new java.io.IOException("无法重置临时文件：" + partFile.getAbsolutePath());
-                }
-                existing = 0;
-                downloaded = 0;
-                total = conn.getContentLengthLong();
-            } else {
-                throw new java.io.IOException("服务器返回异常状态码：" + code);
+                break; // 状态处理完毕，进入读取阶段
             }
 
             listener.onStart(total);
@@ -214,9 +257,7 @@ public final class UpdateDownloader {
             }
 
             if (cancelRequested) {
-                if (partFile.exists() && !partFile.delete()) {
-                    System.err.println("取消下载后无法删除临时文件: " + partFile.getAbsolutePath());
-                }
+                deletePartFile();
                 listener.onCancelled();
             } else if (pauseRequested) {
                 listener.onPaused();
@@ -224,14 +265,7 @@ public final class UpdateDownloader {
                 if (total > 0 && downloaded < total) {
                     throw new java.io.IOException("下载不完整（" + downloaded + "/" + total + " 字节），可稍后继续");
                 }
-                if (finalFile.exists() && !finalFile.delete()) {
-                    throw new java.io.IOException("无法覆盖已存在的文件：" + finalFile.getAbsolutePath());
-                }
-                if (!partFile.renameTo(finalFile)) {
-                    // 跨盘 rename 失败时回退到复制
-                    java.nio.file.Files.move(partFile.toPath(), finalFile.toPath(),
-                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                }
+                completeRename();
                 listener.onProgress(downloaded, total > 0 ? total : downloaded, 0);
                 listener.onComplete(finalFile);
             }
@@ -242,15 +276,32 @@ public final class UpdateDownloader {
                 activeConn = null;
             }
             if (cancelRequested) {
-                if (partFile.exists() && !partFile.delete()) {
-                    System.err.println("取消下载后无法删除临时文件: " + partFile.getAbsolutePath());
-                }
+                deletePartFile();
                 listener.onCancelled();
+            } else if (pauseRequested) {
+                // 暂停时主动断开连接会让阻塞 read 抛 IOException，不是错误，按已暂停处理
+                listener.onPaused();
             } else {
                 listener.onError(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
             }
         } finally {
             clearWorker();
+        }
+    }
+
+    /**
+     * part → 最终文件：必须用 Files.move(REPLACE_EXISTING)。
+     * Windows 上 {@link File#renameTo} 无法覆盖已存在的目标文件（静默返回 false），
+     * 最终文件残留时会导致更新永远无法完成；优先原子替换，不支持时回退非原子
+     */
+    private void completeRename() throws java.io.IOException {
+        try {
+            java.nio.file.Files.move(partFile.toPath(), finalFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            java.nio.file.Files.move(partFile.toPath(), finalFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -312,8 +363,11 @@ public final class UpdateDownloader {
         return new java.io.IOException(hint, e);
     }
 
-    /** 解析形如 {@code bytes 100-199/1000} 的 Content-Range 总长度，失败返回 -1。 */
-    private static long parseTotalFromContentRange(String contentRange) {
+    /**
+     * 解析形如 {@code bytes 100-199/1000} 的 Content-Range 总长度，失败返回 -1。
+     * public：HttpDownloader 的 GET 探测（HEAD 被拒时）也用它取文件总大小。
+     */
+    public static long parseTotalFromContentRange(String contentRange) {
         if (contentRange == null) {
             return -1;
         }

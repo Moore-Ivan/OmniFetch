@@ -3,6 +3,8 @@ package com.downloader.protocol;
 import com.downloader.bencode.BencodeParser;
 import com.downloader.model.ProgressCallback;
 import com.downloader.util.FileUtils;
+import com.downloader.util.HttpTrust;
+import com.downloader.util.RateLimiter;
 
 import java.io.*;
 import java.net.*;
@@ -10,6 +12,7 @@ import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
@@ -29,7 +32,11 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
     private final String source;
     private final String savePath;
+    /** 上次运行回报的实际落盘路径（续传/重试时复用，避免重下生成新文件名）；可为 null */
+    private final String saveFilePath;
     private final ProgressCallback callback;
+    /** 任务级限速器（字节/秒，0=不限）；由工厂下发，可为 null（插件通道） */
+    private final RateLimiter limiter;
     private volatile boolean cancelled = false;
 
     private byte[] peerId;
@@ -49,9 +56,22 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
     public BitTorrentDownloader(String source, String savePath,
                                 ProgressCallback cb) {
+        this(source, savePath, cb, null, null);
+    }
+
+    public BitTorrentDownloader(String source, String savePath,
+                                ProgressCallback cb, String saveFilePath) {
+        this(source, savePath, cb, saveFilePath, null);
+    }
+
+    public BitTorrentDownloader(String source, String savePath,
+                                ProgressCallback cb, String saveFilePath,
+                                RateLimiter limiter) {
         this.source = source;
         this.savePath = savePath;
         this.callback = cb;
+        this.saveFilePath = saveFilePath;
+        this.limiter = limiter;
         this.peerId = generatePeerId();
     }
 
@@ -97,7 +117,8 @@ public class BitTorrentDownloader implements DownloadProtocol {
         }
 
         // 4. 建立文件落盘通道（单文件 / 多文件目录）
-        try (FileSink sink = createFileSink(meta, savePath)) {
+        FileSink sink = createFileSink(meta);
+        try {
             executor = Executors.newFixedThreadPool(Math.min(MAX_PEERS, Math.max(2, peers.size())));
             Semaphore peerLimit = new Semaphore(MAX_PEERS);
             AtomicLong downloaded = new AtomicLong(0);
@@ -158,6 +179,8 @@ public class BitTorrentDownloader implements DownloadProtocol {
                             }
 
                             if (success) {
+                                // 分片级限速：在哈希校验通过后、写盘前获取令牌
+                                RateLimiter.acquire(limiter, data.length);
                                 long position = (long) pieceIndex * meta.pieceLength;
                                 sink.write(position, data, 0, data.length);
 
@@ -207,7 +230,11 @@ public class BitTorrentDownloader implements DownloadProtocol {
             }
 
             executor.shutdown();
-            executor.awaitTermination(30, TimeUnit.MINUTES);
+            // 循环等待全部分片完成：固定 30 分钟上限会在大种子下载中途提前退出，
+            // 触发"下载不完整"误报；这里仅在任务取消时提前结束
+            while (!cancelled && !executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                // 继续等待
+            }
 
             // 完整性校验：只有全部 piece 都校验通过才允许报告完成，
             // 避免 Peer 全部失败/校验不通过时产生 0 字节"假完成"
@@ -227,6 +254,12 @@ public class BitTorrentDownloader implements DownloadProtocol {
             if (executor != null && !executor.isShutdown()) {
                 executor.shutdownNow();
             }
+            FileUtils.closeQuietly(sink);
+        }
+
+        // 单文件种子：全部校验通过后 .part → 最终文件原子改名（失败抛错时保留 .part）
+        if (sink instanceof SingleFileSink single) {
+            single.finish();
         }
 
         if (!cancelled) {
@@ -262,20 +295,23 @@ public class BitTorrentDownloader implements DownloadProtocol {
             String trackerUrl, TorrentMeta meta, byte[] peerId, String event)
             throws Exception {
 
-        String encodedInfoHash = URLEncoder.encode(
-                new String(meta.infoHash, StandardCharsets.ISO_8859_1),
-                StandardCharsets.ISO_8859_1);
-
+        // info_hash/peer_id 是原始二进制：URLEncoder 会把空格(0x20)编成 '+'、
+        // 保留 '*' 等，破坏哈希导致 tracker 查不到 peer，必须逐字节 RFC 3986 编码
         String url = trackerUrl
                 + (trackerUrl.contains("?") ? "&" : "?")
-                + "info_hash=" + encodedInfoHash
-                + "&peer_id=" + URLEncoder.encode(
-                        new String(peerId, StandardCharsets.ISO_8859_1),
-                        StandardCharsets.ISO_8859_1)
+                + "info_hash=" + percentEncode(meta.infoHash)
+                + "&peer_id=" + percentEncode(peerId)
                 + "&port=6881&uploaded=0&downloaded=0&left="
                 + meta.totalLength + "&compact=1&event=" + event;
 
-        byte[] response = HttpClient.newHttpClient()
+        HttpClient.Builder clientBuilder = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(15));
+        // 与其他 HTTP 下载链路一致：信任所有证书，避免运行环境 cacerts 不全时
+        // 访问 HTTPS tracker 直接 PKIX 失败
+        if (HttpTrust.SSL_CONTEXT != null) {
+            clientBuilder.sslContext(HttpTrust.SSL_CONTEXT);
+        }
+        byte[] response = clientBuilder.build()
                 .send(HttpRequest.newBuilder().uri(URI.create(url)).GET().build(),
                         HttpResponse.BodyHandlers.ofByteArray())
                 .body();
@@ -333,7 +369,14 @@ public class BitTorrentDownloader implements DownloadProtocol {
     private TorrentMeta parseMagnetLink(String magnet) throws Exception {
         TorrentMeta meta = new TorrentMeta();
         URI uri = new URI(magnet);
-        String query = uri.getSchemeSpecificPart();
+        // 必须用 raw 形式：getSchemeSpecificPart() 会先解码 %XX，
+        // 与下方 URLDecoder.decode 叠加造成二次解码；
+        // magnet:?xt=... 形式的 SSP 以 '?' 开头，直接 split 会让
+        // 第一个参数名变成 "?xt" 而解析不出 info hash
+        String query = uri.getRawSchemeSpecificPart();
+        if (query.startsWith("?")) {
+            query = query.substring(1);
+        }
 
         for (String param : query.split("&")) {
             String[] kv = param.split("=", 2);
@@ -403,9 +446,12 @@ public class BitTorrentDownloader implements DownloadProtocol {
                 meta.pieceLength = l;
             }
 
-            // 多文件种子：累加各文件长度并记录路径与全局偏移
+            // 多文件种子：累加各文件长度并记录路径与全局偏移。
+            // info.files 存在即视为多文件种子（即使只有一个条目——
+            // 该种子仍带目录名结构，不能按单文件直接落盘）
             Object files = info.get("files");
             if (files instanceof List<?> fileList && !fileList.isEmpty()) {
+                meta.multiFile = true;
                 long offset = 0;
                 int idx = 0;
                 for (Object f : fileList) {
@@ -477,12 +523,39 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
     // --- 文件落盘 ---
 
-    private FileSink createFileSink(TorrentMeta meta, String savePath)
-            throws IOException {
-        if (meta.files.size() > 1) {
-            return new MultiFileSink(savePath, meta);
+    private FileSink createFileSink(TorrentMeta meta) throws IOException {
+        if (meta.multiFile) {
+            // 多文件：saveFilePath 是上次回报的基准目录（续传/重试复用，
+            // 避免重新避让生成新目录名）；首次下载按种子名建目录
+            File baseDir;
+            if (saveFilePath != null && !saveFilePath.isEmpty()) {
+                baseDir = new File(saveFilePath);
+            } else {
+                baseDir = new File(savePath, meta.name);
+                if (baseDir.exists() && !baseDir.isDirectory()) {
+                    // 同名文件占用目录名时加后缀避让
+                    baseDir = new File(savePath, meta.name + "_bt");
+                }
+            }
+            if (!baseDir.exists() && !baseDir.mkdirs()) {
+                throw new IOException("无法创建下载目录: " + baseDir.getAbsolutePath());
+            }
+            // 目录路径回报给任务：重试/续传复用，"打开目录"也以它为准
+            callback.onSaveFile(baseDir);
+            return new MultiFileSink(baseDir, meta);
         }
-        return new SingleFileSink(savePath, meta);
+
+        // 单文件：saveFilePath 复用上次落盘路径，避免重试时 buildSaveFile
+        // 二次避让生成 name(1).ext 之类的新文件
+        File saveFile;
+        if (saveFilePath != null && !saveFilePath.isEmpty()) {
+            saveFile = new File(saveFilePath);
+        } else {
+            saveFile = FileUtils.buildSaveFile(savePath, meta.name);
+        }
+        callback.onSaveFile(saveFile);
+        // 写入 .part 隔离文件，全部分片校验通过后原子改名为最终文件
+        return new SingleFileSink(saveFile, meta);
     }
 
     /** 分片数据落盘抽象：按种子全局偏移写入，允许跨文件边界 */
@@ -493,10 +566,13 @@ public class BitTorrentDownloader implements DownloadProtocol {
 
     private static final class SingleFileSink implements FileSink {
         private final RandomAccessFile raf;
+        private final File partFile;
+        private final File finalFile;
 
-        SingleFileSink(String savePath, TorrentMeta meta) throws IOException {
-            File saveFile = FileUtils.buildSaveFile(savePath, meta.name);
-            this.raf = new RandomAccessFile(saveFile, "rw");
+        SingleFileSink(File finalFile, TorrentMeta meta) throws IOException {
+            this.finalFile = finalFile;
+            this.partFile = new File(finalFile.getAbsolutePath() + ".part");
+            this.raf = new RandomAccessFile(partFile, "rw");
             raf.setLength(meta.totalLength);
         }
 
@@ -505,6 +581,11 @@ public class BitTorrentDownloader implements DownloadProtocol {
                 throws IOException {
             raf.seek(globalOffset);
             raf.write(data, off, len);
+        }
+
+        /** 下载完成（完整性校验通过）后调用：.part 原子改名为最终文件 */
+        void finish() throws IOException {
+            FileUtils.atomicMove(partFile.toPath(), finalFile.toPath());
         }
 
         @Override
@@ -517,17 +598,9 @@ public class BitTorrentDownloader implements DownloadProtocol {
         private final List<RandomAccessFile> channels;
         private final TorrentMeta meta;
 
-        MultiFileSink(String savePath, TorrentMeta meta) throws IOException {
+        MultiFileSink(File baseDir, TorrentMeta meta) throws IOException {
             this.meta = meta;
             this.channels = new ArrayList<>(meta.files.size());
-            File baseDir = new File(savePath, meta.name);
-            if (baseDir.exists() && !baseDir.isDirectory()) {
-                // 同名文件占用目录名时加后缀避让
-                baseDir = new File(savePath, meta.name + "_bt");
-            }
-            if (!baseDir.exists() && !baseDir.mkdirs()) {
-                throw new IOException("无法创建下载目录: " + baseDir.getAbsolutePath());
-            }
             for (FileEntry entry : meta.files) {
                 File f = baseDir.toPath().resolve(
                         String.join(File.separator, entry.path)).toFile();
@@ -547,18 +620,7 @@ public class BitTorrentDownloader implements DownloadProtocol {
             int written = 0;
             while (written < len) {
                 long absPos = globalOffset + written;
-                // 定位全局偏移所属文件（文件数通常不多，逆序/顺序查找均可）
-                int idx = 0;
-                for (int i = 0; i < meta.files.size(); i++) {
-                    FileEntry e = meta.files.get(i);
-                    if (absPos >= e.offset && absPos < e.offset + e.length) {
-                        idx = i;
-                        break;
-                    }
-                    if (i == meta.files.size() - 1) {
-                        idx = i;
-                    }
-                }
+                int idx = locateFile(absPos);
                 FileEntry e = meta.files.get(idx);
                 long inFilePos = absPos - e.offset;
                 int chunk = (int) Math.min(len - written, e.length - inFilePos);
@@ -567,6 +629,28 @@ public class BitTorrentDownloader implements DownloadProtocol {
                 raf.write(data, off + written, chunk);
                 written += chunk;
             }
+        }
+
+        /**
+         * 二分定位全局偏移所属文件（files 按 offset 升序且互不重叠），
+         * 文件数多时把每次写入的 O(n) 线性扫描降为 O(log n)；未命中回落最后一个文件。
+         */
+        private int locateFile(long absPos) {
+            int lo = 0;
+            int hi = meta.files.size() - 1;
+            int fallback = meta.files.size() - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >>> 1;
+                FileEntry e = meta.files.get(mid);
+                if (absPos < e.offset) {
+                    hi = mid - 1;
+                } else if (absPos >= e.offset + e.length) {
+                    lo = mid + 1;
+                } else {
+                    return mid;
+                }
+            }
+            return fallback;
         }
 
         @Override
@@ -614,6 +698,26 @@ public class BitTorrentDownloader implements DownloadProtocol {
         return bytes;
     }
 
+    /**
+     * 逐字节 percent-encode（RFC 3986 unreserved：字母数字与 -._~）。
+     * URLEncoder 面向表单编码（空格变 '+'、保留 '*' 等），不适合编码
+     * info_hash / peer_id 这类二进制数据。
+     */
+    private static String percentEncode(byte[] data) {
+        StringBuilder sb = new StringBuilder(data.length * 3);
+        for (byte b : data) {
+            char c = (char) (b & 0xFF);
+            if (Character.isLetterOrDigit(c) || c == '-' || c == '.'
+                    || c == '_' || c == '~') {
+                sb.append(c);
+            } else {
+                sb.append('%')
+                        .append(String.format("%02X", b & 0xFF));
+            }
+        }
+        return sb.toString();
+    }
+
     @Override
     public void cancel() {
         cancelled = true;
@@ -640,7 +744,9 @@ public class BitTorrentDownloader implements DownloadProtocol {
         byte[] infoHash;
         List<byte[]> pieceHashes = new ArrayList<>();
         List<String> announceUrls = new ArrayList<>();
-        /** 多文件种子的文件列表（size>1 时生效），offset 为该文件在全量数据中的起始偏移 */
+        /** 是否多文件种子：info.files 存在即为 true（即使只有一个条目） */
+        boolean multiFile;
+        /** 多文件种子的文件列表，offset 为该文件在全量数据中的起始偏移 */
         List<FileEntry> files = new ArrayList<>();
 
         int pieceLength(int index, int count, long total) {

@@ -33,7 +33,7 @@ public final class HttpTrust {
             context = SSLContext.getInstance("TLS");
             context.init(null, trustAll, new java.security.SecureRandom());
         } catch (Exception e) {
-            System.err.println("初始化信任所有证书的 SSLContext 失败，将使用 JDK 默认信任库: "
+            AppLogger.warn("初始化信任所有证书的 SSLContext 失败，将使用 JDK 默认信任库: "
                     + e.getMessage());
         }
         SSL_CONTEXT = context;

@@ -1,6 +1,8 @@
 package com.downloader.gui;
 
+import com.downloader.util.AppLogger;
 import com.downloader.util.FileUtils;
+import com.downloader.util.HttpTrust;
 import com.downloader.util.InstallerLauncher;
 import com.downloader.util.UpdateChecker;
 import com.downloader.util.UpdateChecker.Result;
@@ -14,8 +16,19 @@ import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 应用更新对话框。
@@ -53,6 +66,17 @@ final class UpdateDialog extends JDialog {
     private JPanel buttonBar;
     private JButton primaryButton;
 
+    // 主题换肤支持：updateComponentTreeUI 不会重建自绘 LineBorder / 显式前景色，
+    // 需要在组件 updateUI 时按新主题色重建
+    private JScrollPane notesScroll;
+    private JPanel progressPanel;
+    private JLabel subtitleLabel;
+    private String lastStatusText = " ";
+    private Color lastStatusColor;
+
+    /** sha256sum 文本中的 64 位十六进制摘要 */
+    private static final Pattern SHA256_HEX = Pattern.compile("[0-9a-fA-F]{64}");
+
     UpdateDialog(MainWindow owner, Result result, String currentVersionDisplay) {
         // 非模态：更新窗口打开期间主窗口仍可正常使用
         super(owner, "检查更新", ModalityType.MODELESS);
@@ -61,7 +85,9 @@ final class UpdateDialog extends JDialog {
         this.asset = pickWindowsAsset(result);
         File dir = UpdateDownloader.defaultDownloadDir();
         dir.mkdirs();
-        this.installerFile = asset != null ? new File(dir, asset.name) : null;
+        // 文件名来自 GitHub API 响应，清洗防止异常字符写入非法路径
+        this.installerFile = asset != null
+                ? new File(dir, FileUtils.sanitizeFileName(asset.name)) : null;
 
         Image icon = MainWindow.loadAppIcon();
         if (icon != null) {
@@ -71,17 +97,19 @@ final class UpdateDialog extends JDialog {
     }
 
     private static Asset pickWindowsAsset(Result result) {
-        Asset fallback = null;
+        // 仅接受 Windows 安装包且优先 .exe：其他平台资产（.dmg/.deb/.zip 等）
+        // 下载后无法自动安装，返回 null 让对话框退化为仅提供「查看发布页」
+        Asset msi = null;
         for (Asset a : result.assets) {
             String name = a.name.toLowerCase(Locale.ROOT);
             if (name.endsWith(".exe")) {
                 return a;
             }
-            if (fallback == null) {
-                fallback = a;
+            if (msi == null && name.endsWith(".msi")) {
+                msi = a;
             }
         }
-        return fallback;
+        return msi;
     }
 
     private void initUI(String currentVersionDisplay) {
@@ -103,13 +131,20 @@ final class UpdateDialog extends JDialog {
         title.setFont(baseFont != null ? baseFont.deriveFont(Font.BOLD, 16f)
                 : new Font(Font.SANS_SERIF, Font.BOLD, 16));
         title.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel subtitle = new JLabel("当前版本 " + currentVersionDisplay
-                + "    安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath());
-        subtitle.setForeground(UIManager.getColor("Label.disabledForeground"));
-        subtitle.setAlignmentX(Component.LEFT_ALIGNMENT);
+        // updateUI 时按新主题重建前景色（显式 setForeground 不会被换肤覆盖）
+        subtitleLabel = new JLabel("当前版本 " + currentVersionDisplay
+                + "    安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath()) {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                setForeground(UIManager.getColor("Label.disabledForeground"));
+            }
+        };
+        subtitleLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        subtitleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         titleBox.add(title);
         titleBox.add(Box.createVerticalStrut(3));
-        titleBox.add(subtitle);
+        titleBox.add(subtitleLabel);
         header.add(titleBox, BorderLayout.CENTER);
         root.add(header);
         root.add(Box.createVerticalStrut(12));
@@ -124,7 +159,17 @@ final class UpdateDialog extends JDialog {
             notesArea.setFont(baseFont);
             notesArea.setBackground(UIManager.getColor("Panel.background"));
             notesArea.setCaretPosition(0);
-            JScrollPane notesScroll = new JScrollPane(notesArea);
+            notesScroll = new JScrollPane(notesArea) {
+                @Override
+                public void updateUI() {
+                    super.updateUI();
+                    // 显式设置的 LineBorder 非 UIResource，换肤时不会被重置，
+                    // 必须在 updateUI 里按新主题色重建
+                    setBorder(BorderFactory.createCompoundBorder(
+                            new LineBorder(UIManager.getColor("Component.borderColor"), 1, true),
+                            new EmptyBorder(8, 10, 8, 10)));
+                }
+            };
             notesScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
             notesScroll.setBorder(BorderFactory.createCompoundBorder(
                     new LineBorder(UIManager.getColor("Component.borderColor"), 1, true),
@@ -136,7 +181,15 @@ final class UpdateDialog extends JDialog {
         }
 
         // ── 下载进度区 ──
-        JPanel progressPanel = new JPanel();
+        progressPanel = new JPanel() {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                setBorder(BorderFactory.createCompoundBorder(
+                        new LineBorder(UIManager.getColor("Component.borderColor"), 1, true),
+                        new EmptyBorder(12, 14, 12, 14)));
+            }
+        };
         progressPanel.setLayout(new BoxLayout(progressPanel, BoxLayout.Y_AXIS));
         progressPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
         progressPanel.setBorder(BorderFactory.createCompoundBorder(
@@ -160,7 +213,17 @@ final class UpdateDialog extends JDialog {
         infoRow.add(speedLabel, BorderLayout.CENTER);
         infoRow.add(sizeLabel, BorderLayout.EAST);
 
-        statusLabel = new JLabel(" ");
+        statusLabel = new JLabel(" ") {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                // 状态行文本/颜色随状态变化，换肤后按最近一次状态重建
+                setText(lastStatusText);
+                setToolTipText(lastStatusText);
+                setForeground(lastStatusColor != null
+                        ? lastStatusColor : UIManager.getColor("Label.foreground"));
+            }
+        };
         statusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         progressPanel.add(progressBar);
@@ -185,11 +248,16 @@ final class UpdateDialog extends JDialog {
             }
         });
 
-        // 若安装包已在目录中（上次已下载完成），直接进入完成态
-        if (installerFile != null && installerFile.exists()
-                && (asset.size <= 0 || installerFile.length() == asset.size)) {
+        // 若安装包已在目录中且可信（上次已下载完成），直接进入完成态；
+        // 大小不匹配/内容无效的残留（上次下载中断）先删除，避免被误判为已完成
+        if (installerFile != null && existingInstallerLooksValid()) {
             setState(State.COMPLETED);
         } else {
+            if (installerFile != null && installerFile.exists()
+                    && !installerFile.delete()) {
+                // 删除失败仅记录：READY 态点击「立即更新」时 beginDownload 会再尝试
+                AppLogger.warn("无法删除无效的安装包残留: " + installerFile.getAbsolutePath());
+            }
             setState(State.READY);
         }
 
@@ -299,6 +367,9 @@ final class UpdateDialog extends JDialog {
     }
 
     private void status(String text, Color color) {
+        // 记录最近一次状态：组件 updateUI（主题切换）时据此重建状态行
+        lastStatusText = text;
+        lastStatusColor = color;
         statusLabel.setText(text);
         statusLabel.setForeground(color != null ? color : UIManager.getColor("Label.foreground"));
         // 状态行空间有限（如 PKIX 长报错会被截断），悬停可查看完整内容
@@ -311,24 +382,28 @@ final class UpdateDialog extends JDialog {
         if (asset == null || installerFile == null) {
             return;
         }
-        if (installerFile.exists() && (asset.size <= 0 || installerFile.length() == asset.size)) {
+        if (existingInstallerLooksValid()) {
             setState(State.COMPLETED);
             return;
         }
-        // 已存在但大小不匹配的安装包是上次遗留的坏文件：
+        // 已存在的安装包是无效残留（大小不匹配/内容损坏）：
         // UpdateDownloader.start() 见到最终文件存在会直接返回，
-        // 不先删除会导致界面进入 DOWNLOADING 却永远没有进度。
-        // 同时清掉可能属于旧版本的 .part，避免把新内容追加到旧断点上。
-        if (installerFile.exists() && !installerFile.delete()) {
+        // 不先删除会导致界面进入 DOWNLOADING 却永远没有进度
+        boolean hadStaleFinal = installerFile.exists();
+        if (hadStaleFinal && !installerFile.delete()) {
             status("无法覆盖已存在的安装包文件：" + installerFile.getAbsolutePath(),
                     MainWindow.DANGER);
             return;
         }
-        File stalePart = new File(installerFile.getAbsolutePath() + ".part");
-        if (stalePart.exists() && !stalePart.delete()) {
-            status("无法清理旧的下载临时文件：" + stalePart.getAbsolutePath(),
-                    MainWindow.DANGER);
-            return;
+        // 仅当最终文件是无效残留时才丢弃 .part（其断点内容已不可信）；
+        // 最终文件不存在时保留 .part，支持跨会话断点续传
+        if (hadStaleFinal) {
+            File stalePart = new File(installerFile.getAbsolutePath() + ".part");
+            if (stalePart.exists() && !stalePart.delete()) {
+                status("无法清理旧的下载临时文件：" + stalePart.getAbsolutePath(),
+                        MainWindow.DANGER);
+                return;
+            }
         }
         progressBar.setIndeterminate(false);
         downloader = new UpdateDownloader(asset.downloadUrl, installerFile, new UpdateDownloader.Listener() {
@@ -365,13 +440,28 @@ final class UpdateDialog extends JDialog {
 
             @Override
             public void onComplete(File file) {
-                EventQueue.invokeLater(() -> {
-                    updateProgress(file.length(), asset.size > 0 ? asset.size : file.length(), 0, true);
-                    setState(State.COMPLETED);
-                    // 后台模式下下载完成：自动启动安装程序，不打断用户操作
-                    if (background) {
-                        autoInstallInBackground();
-                    }
+                EventQueue.invokeLater(() ->
+                        updateProgress(file.length(),
+                                asset.size > 0 ? asset.size : file.length(), 0, true));
+                // SHA-256 校验含网络拉取与流式摘要，放虚拟线程执行，完成后再回 EDT 收尾
+                Thread.ofVirtual().start(() -> {
+                    String error = verifySha256(file);
+                    EventQueue.invokeLater(() -> {
+                        if (error != null) {
+                            errorMessage = error;
+                            setState(State.ERROR);
+                            if (background) {
+                                Toast.warning(owner, "更新包校验失败：" + error
+                                        + "，点击「检查更新」查看并重试");
+                            }
+                            return;
+                        }
+                        setState(State.COMPLETED);
+                        // 后台模式下下载完成：自动启动安装程序，不打断用户操作
+                        if (background) {
+                            autoInstallInBackground();
+                        }
+                    });
                 });
             }
 
@@ -471,7 +561,7 @@ final class UpdateDialog extends JDialog {
         String invalid = checkInstallerValid();
         if (invalid != null) {
             if (!installerFile.delete()) {
-                System.err.println("无法删除无效安装包: " + installerFile.getAbsolutePath());
+                AppLogger.warn("无法删除无效安装包: " + installerFile.getAbsolutePath());
             }
             errorMessage = invalid;
             setState(State.ERROR);
@@ -492,6 +582,21 @@ final class UpdateDialog extends JDialog {
         }
     }
 
+    /**
+     * 目录中的安装包残留是否可信：
+     * 已知大小（asset.size&gt;0）时比对实际长度；大小未知时对 .exe 做 MZ 头校验。
+     * 无效残留（上次下载中断/损坏）必须删除，否则会被误判为"已下载完成"。
+     */
+    private boolean existingInstallerLooksValid() {
+        if (!installerFile.exists() || installerFile.length() <= 0) {
+            return false;
+        }
+        if (asset.size > 0) {
+            return installerFile.length() == asset.size;
+        }
+        return checkInstallerValid() == null;
+    }
+
     /** 校验 .exe 安装包的 PE 头（MZ）；有效返回 null，异常返回原因。 */
     private String checkInstallerValid() {
         if (!installerFile.getName().toLowerCase(Locale.ROOT).endsWith(".exe")) {
@@ -507,6 +612,111 @@ final class UpdateDialog extends JDialog {
             return "无法读取安装包：" + e.getMessage();
         }
         return null;
+    }
+
+    /**
+     * 安装包 SHA-256 完整性校验（后台线程调用，完成后回 EDT）：
+     * 发布资产附带同名 .sha256 文件时拉取期望摘要并与本地文件流式摘要比对；
+     * 不匹配删除安装包并返回错误原因（回到可重新下载状态）。
+     * 无 .sha256 资产返回 null（沿用大小 + MZ 头校验）；
+     * 校验值拉取失败仅提示降级、不阻断安装（避免发布侧失误导致无法更新）。
+     */
+    private String verifySha256(File file) {
+        Asset shaAsset = findSha256Asset();
+        if (shaAsset == null) {
+            return null;
+        }
+        edtStatus("正在校验安装包完整性（SHA-256）…", null);
+        String expected;
+        try {
+            expected = fetchExpectedSha256(shaAsset);
+        } catch (Exception e) {
+            edtStatus("SHA-256 校验值获取失败，已跳过校验：" + e.getMessage(), MainWindow.WARNING);
+            return null;
+        }
+        if (expected == null) {
+            edtStatus("校验值文件格式无法识别，已跳过 SHA-256 校验", MainWindow.WARNING);
+            return null;
+        }
+        String actual;
+        try {
+            actual = sha256Hex(file);
+        } catch (IOException e) {
+            return "无法读取安装包计算 SHA-256：" + e.getMessage();
+        }
+        if (!actual.equalsIgnoreCase(expected)) {
+            if (file.exists() && !file.delete()) {
+                return "安装包 SHA-256 校验不匹配，且删除损坏文件失败，请手动删除："
+                        + file.getAbsolutePath();
+            }
+            return "安装包 SHA-256 校验不匹配（下载不完整或被篡改），已删除，请重新下载";
+        }
+        return null;
+    }
+
+    /** 在发布资产中查找安装包同名的 .sha256 校验文件。 */
+    private Asset findSha256Asset() {
+        if (installerFile == null || result.assets == null) {
+            return null;
+        }
+        String wanted = installerFile.getName().toLowerCase(Locale.ROOT) + ".sha256";
+        for (Asset a : result.assets) {
+            if (a.name != null && a.name.toLowerCase(Locale.ROOT).equals(wanted)) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    /** 拉取 .sha256 文本并提取首个 64 位十六进制摘要（兼容 sha256sum 的 "hex  filename" 格式）。 */
+    private static String fetchExpectedSha256(Asset shaAsset) throws Exception {
+        HttpClient.Builder builder = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL);
+        // 与更新链路一致：信任所有证书（精简 JRE cacerts 不全 / 本地加速代理自签证书）
+        if (HttpTrust.SSL_CONTEXT != null) {
+            builder.sslContext(HttpTrust.SSL_CONTEXT);
+        }
+        HttpRequest request = HttpRequest.newBuilder(URI.create(shaAsset.downloadUrl))
+                .timeout(Duration.ofSeconds(15))
+                .header("Accept", "text/plain,*/*")
+                .GET()
+                .build();
+        HttpResponse<String> resp = builder.build()
+                .send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (resp.statusCode() / 100 != 2) {
+            throw new IOException("HTTP " + resp.statusCode());
+        }
+        Matcher m = SHA256_HEX.matcher(resp.body());
+        return m.find() ? m.group() : null;
+    }
+
+    /** 流式计算文件 SHA-256（64KB 缓冲，避免大文件占内存）。 */
+    private static String sha256Hex(File file) throws IOException {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException("JVM 不支持 SHA-256", e);
+        }
+        try (InputStream in = Files.newInputStream(file.toPath())) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                digest.update(buf, 0, n);
+            }
+        }
+        StringBuilder sb = new StringBuilder(64);
+        for (byte b : digest.digest()) {
+            sb.append(Character.forDigit((b >> 4) & 0xF, 16))
+                    .append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    /** 非 EDT 安全的 status() 包装：校验线程经此回调状态行 */
+    private void edtStatus(String text, Color color) {
+        EventQueue.invokeLater(() -> status(text, color));
     }
 
     // ══════ 后台模式 ══════
@@ -548,7 +758,7 @@ final class UpdateDialog extends JDialog {
         String invalid = checkInstallerValid();
         if (invalid != null) {
             if (!installerFile.delete()) {
-                System.err.println("无法删除无效安装包: " + installerFile.getAbsolutePath());
+                AppLogger.warn("无法删除无效安装包: " + installerFile.getAbsolutePath());
             }
             errorMessage = invalid;
             setState(State.ERROR);

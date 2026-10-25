@@ -4,6 +4,7 @@ import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
 import com.downloader.util.FileUtils;
 import com.downloader.util.HttpTrust;
+import com.downloader.util.RateLimiter;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
@@ -26,6 +27,8 @@ public class M3u8Downloader implements DownloadProtocol {
     private final String playlistURL;
     private final String savePath;
     private final ProgressCallback callback;
+    /** 任务级限速器（字节/秒，0=不限）；可为 null（插件/旧构造通道） */
+    private final RateLimiter limiter;
     private volatile boolean cancelled = false;
 
     private final HttpClient httpClient;
@@ -37,9 +40,15 @@ public class M3u8Downloader implements DownloadProtocol {
     private final ConfigManager configManager = ConfigManager.getInstance();
 
     public M3u8Downloader(String url, String savePath, ProgressCallback cb) {
+        this(url, savePath, cb, null);
+    }
+
+    public M3u8Downloader(String url, String savePath, ProgressCallback cb,
+                          RateLimiter limiter) {
         this.playlistURL = url;
         this.savePath = savePath;
         this.callback = cb;
+        this.limiter = limiter;
         HttpClient.Builder clientBuilder = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(CONNECT_TIMEOUT_SEC))
                 .followRedirects(HttpClient.Redirect.NORMAL);
@@ -55,7 +64,7 @@ public class M3u8Downloader implements DownloadProtocol {
     public void download() throws Exception {
         callback.onStatusUpdate("解析 m3u8 播放列表...");
 
-        // 1. 下载并解析 m3u8
+        // 1. 下载并解析 m3u8（密钥拉取失败等错误直接抛出，绝不静默降级为未加密）
         Playlist parsed = parsePlaylist(fetchURL(playlistURL),
                 baseUrlOf(playlistURL));
         List<Segment> segments = parsed.segments;
@@ -81,7 +90,13 @@ public class M3u8Downloader implements DownloadProtocol {
         final String finalBaseUrl = baseUrl;
 
         int total = segments.size();
-        callback.onConnected("stream.ts", -1);
+
+        // 提前确定最终输出文件并回报真实路径（此前回调硬编码 stream.ts，
+        // 而实际输出是 output_时间戳.ts，导致"打开文件"指向不存在的路径）
+        String outName = "output_" + System.currentTimeMillis() + ".ts";
+        File outputFile = FileUtils.buildSaveFile(savePath, outName);
+        callback.onConnected(outputFile.getName(), -1);
+        callback.onSaveFile(outputFile);
         callback.onStatusUpdate("共 " + total + " 个分片，开始下载...");
 
         // 2. 创建临时目录
@@ -123,6 +138,9 @@ public class M3u8Downloader implements DownloadProtocol {
                             data = decryptAES128(data, seg.encryptionKey, iv);
                         }
 
+                        // 限速（令牌桶；limiter 为 null 时直接放行）
+                        RateLimiter.acquire(limiter, data.length);
+
                         Path segFile = tempDir.resolve(
                                 String.format("%05d.ts", index));
                         Files.write(segFile, data);
@@ -163,10 +181,9 @@ public class M3u8Downloader implements DownloadProtocol {
                 throw new IOException(firstError.get());
             }
 
-            // 4. 按顺序合并分片（流式复制，避免一次性读入大分片导致 OOM）
+            // 4. 按顺序合并分片（流式复制，避免一次性读入大分片导致 OOM）；
+            // 输出文件在下载开始前已确定，这里不再重复生成文件名
             callback.onStatusUpdate("合并分片...");
-            String outName = "output_" + System.currentTimeMillis() + ".ts";
-            File outputFile = FileUtils.buildSaveFile(savePath, outName);
 
             try (FileOutputStream fos = new FileOutputStream(outputFile)) {
                 byte[] copyBuf = new byte[MERGE_BUFFER_SIZE];
@@ -205,7 +222,7 @@ public class M3u8Downloader implements DownloadProtocol {
 
     // --- m3u8 解析 ---
 
-    private Playlist parsePlaylist(String content, String baseUrl) {
+    private Playlist parsePlaylist(String content, String baseUrl) throws IOException {
         Playlist playlist = new Playlist(baseUrl);
         String[] lines = content.split("\n");
         KeyInfo currentKey = null;
@@ -227,7 +244,8 @@ public class M3u8Downloader implements DownloadProtocol {
                             line.substring(line.indexOf(':') + 1).trim());
                 } catch (NumberFormatException ignored) {}
             } else if (line.startsWith("#EXT-X-KEY:")) {
-                // METHOD=NONE 表示取消加密；否则解析 URI/IV 并拉取密钥
+                // METHOD=NONE 表示取消加密；密钥拉取失败/密钥长度非法都直接抛错，
+                // 绝不静默按未加密处理（会产生无法播放的损坏文件）
                 currentKey = parseKeyInfo(line, baseUrl);
             } else if (line.startsWith("#EXTINF:")) {
                 if (i + 1 < lines.length) {
@@ -244,15 +262,24 @@ public class M3u8Downloader implements DownloadProtocol {
         return playlist;
     }
 
-    /** 解析 EXT-X-KEY；METHOD=NONE 返回 null，拉取密钥失败也返回 null（按未加密处理） */
-    private KeyInfo parseKeyInfo(String keyLine, String baseUrl) {
+    /**
+     * 解析 EXT-X-KEY。METHOD=NONE 返回 null；其余情况：
+     * <ul>
+     *   <li>仅支持 AES-128，其他加密方式显式报错（避免按明文写出损坏内容）；</li>
+     *   <li>有 METHOD 但缺少 URI、密钥拉取失败、密钥长度不是 16 字节，一律抛异常。</li>
+     * </ul>
+     */
+    private KeyInfo parseKeyInfo(String keyLine, String baseUrl) throws IOException {
         String method = attrValue(keyLine, "METHOD");
         if (method == null || "NONE".equalsIgnoreCase(method)) {
             return null;
         }
+        if (!"AES-128".equalsIgnoreCase(method)) {
+            throw new IOException("不支持的 HLS 加密方式: " + method + "（仅支持 AES-128）");
+        }
         String uri = attrValue(keyLine, "URI");
         if (uri == null) {
-            return null;
+            throw new IOException("AES-128 加密播放列表缺少密钥 URI（EXT-X-KEY）");
         }
 
         KeyInfo info = new KeyInfo();
@@ -263,11 +290,12 @@ public class M3u8Downloader implements DownloadProtocol {
         try {
             info.key = fetchBytes(resolveURL(baseUrl, uri));
         } catch (Exception e) {
-            return null;
+            throw new IOException("拉取解密密钥失败: " + uri
+                    + (e.getMessage() != null ? "（" + e.getMessage() + "）" : ""), e);
         }
         if (info.key == null || info.key.length != 16) {
-            // AES-128 密钥必须是 16 字节，无效则不标记加密
-            return null;
+            throw new IOException("AES-128 密钥长度非法（期望 16 字节，实际 "
+                    + (info.key == null ? 0 : info.key.length) + " 字节）: " + uri);
         }
         return info;
     }
@@ -351,29 +379,53 @@ public class M3u8Downloader implements DownloadProtocol {
 
     // --- HTTP 辅助 ---
 
+    /** 拉取文本播放列表，非 2xx 状态码直接抛错（错误页绝不能当播放列表解析） */
     private String fetchURL(String url) throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("User-Agent", "Mozilla/5.0")
+                .header("Accept-Encoding", "identity")
                 .GET().build();
-        return httpClient.send(req,
-                HttpResponse.BodyHandlers.ofString()).body();
+        HttpResponse<String> resp = httpClient.send(req,
+                HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("HTTP " + resp.statusCode() + "，获取播放列表失败: " + url);
+        }
+        return resp.body();
     }
 
+    /** 拉取二进制内容（分片/密钥），非 2xx 状态码直接抛错 */
     private byte[] fetchBytes(String url) throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("User-Agent", "Mozilla/5.0")
+                .header("Accept-Encoding", "identity")
                 .GET().build();
-        return httpClient.send(req,
-                HttpResponse.BodyHandlers.ofByteArray()).body();
+        HttpResponse<byte[]> resp = httpClient.send(req,
+                HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("HTTP " + resp.statusCode() + "，获取分片/密钥失败: " + url);
+        }
+        return resp.body();
     }
 
-    private String resolveURL(String base, String relative) {
+    /**
+     * 相对地址解析：优先使用 URI.resolve（正确处理 /seg.ts、../seg.ts、带查询串的地址），
+     * 非法字符等异常场景回退到旧的字符串拼接。
+     */
+    private static String resolveURL(String base, String relative) {
         if (relative.startsWith("http://") || relative.startsWith("https://")) {
             return relative;
         }
-        return base + relative;
+        try {
+            URI rel = URI.create(relative.trim());
+            if (rel.isAbsolute()) {
+                return relative;
+            }
+            return URI.create(base).resolve(rel).toString();
+        } catch (IllegalArgumentException e) {
+            return base + relative;
+        }
     }
 
     @Override

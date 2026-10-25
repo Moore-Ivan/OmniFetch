@@ -20,9 +20,10 @@ public class SftpConnectionPool extends AbstractConnectionPool<SftpConnectionPoo
     private final String pass;
     private final int connectTimeoutMs;
     
-    // 存储连接的创建时间，用于清理超时连接
-    private final ConcurrentMap<SftpConnection, Long> connectionCreationTimes;
-    
+    // 存储连接的最后使用时间，用于清理空闲超时的连接
+    // （与 FTP 连接池对齐：此前按"创建时间"清理，刚归还的活跃连接可能被立刻误杀）
+    private final ConcurrentMap<SftpConnection, Long> connectionLastUsedTimes;
+
     public SftpConnectionPool(String host, int port, String user, String pass) {
         super();
         this.host = host;
@@ -31,31 +32,39 @@ public class SftpConnectionPool extends AbstractConnectionPool<SftpConnectionPoo
         this.pass = pass;
         ConfigManager configManager = ConfigManager.getInstance();
         this.connectTimeoutMs = configManager.getInt("ftp.connectionTimeoutSec", 30) * 1000;
-        this.connectionCreationTimes = new ConcurrentHashMap<>();
+        this.connectionLastUsedTimes = new ConcurrentHashMap<>();
     }
-    
+
+    /** 归还连接时刷新最后使用时间，避免活跃连接被空闲清理误杀 */
+    @Override
+    public void releaseConnection(SftpConnection connection) {
+        if (connection != null) {
+            connectionLastUsedTimes.put(connection, System.currentTimeMillis());
+        }
+        super.releaseConnection(connection);
+    }
+
     @Override
     protected void cleanupIdleConnections() {
         long now = System.currentTimeMillis();
         for (SftpConnection connection : idleConnections) {
-            Long createTime = connectionCreationTimes.get(connection);
-            if (createTime != null && now - createTime > idleTimeoutMs) {
+            Long lastUsed = connectionLastUsedTimes.get(connection);
+            if (lastUsed != null && now - lastUsed > idleTimeoutMs) {
                 if (idleConnections.remove(connection)) {
                     closeConnection(connection);
-                    connectionCreationTimes.remove(connection);
                 }
             }
         }
     }
-    
+
     @Override
     protected SftpConnection createConnection() throws Exception {
         SftpConnection connection = new SftpConnection();
         connection.connect();
-        connectionCreationTimes.put(connection, System.currentTimeMillis());
+        connectionLastUsedTimes.put(connection, System.currentTimeMillis());
         return connection;
     }
-    
+
     @Override
     protected boolean isValid(SftpConnection connection) {
         try {
@@ -64,11 +73,11 @@ public class SftpConnectionPool extends AbstractConnectionPool<SftpConnectionPoo
             return false;
         }
     }
-    
+
     @Override
     protected void closeConnection(SftpConnection connection) {
         if (connection != null) {
-            connectionCreationTimes.remove(connection);
+            connectionLastUsedTimes.remove(connection);
             connection.close();
         }
     }

@@ -1,6 +1,10 @@
 package com.downloader.event;
 
+import com.downloader.util.AppLogger;
+
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -8,11 +12,18 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * 支持多监听器订阅和事件发布
  */
 public class EventBus {
-    
+
     private static EventBus instance;
     private final List<DownloadListener> downloadListeners;
     private final List<ConfigChangeListener> configListeners;
-    
+    /**
+     * 高频进度事件（TASK_UPDATED）按窗口节流：同一任务在窗口内的重复事件直接丢弃。
+     * UI 侧已有 80ms 合并定时器按任务对象实时取值，事件仅作触发信号，丢中间帧无副作用；
+     * 状态类事件（完成/失败/暂停等）不节流。
+     */
+    private static final long TASK_UPDATED_THROTTLE_MS = 100;
+    private final ConcurrentMap<String, Long> lastTaskUpdatedAt = new ConcurrentHashMap<>();
+
     private EventBus() {
         // 使用CopyOnWriteArrayList确保线程安全
         downloadListeners = new CopyOnWriteArrayList<>();
@@ -71,12 +82,26 @@ public class EventBus {
      * @param event 下载事件
      */
     public void publish(DownloadEvent event) {
+        // 进度事件节流：同一任务窗口内的重复 TASK_UPDATED 丢弃，降低监听器与 EDT 压力
+        if (event.getType() == DownloadEvent.EventType.TASK_UPDATED && event.getTask() != null) {
+            String taskId = event.getTask().getId();
+            long now = System.currentTimeMillis();
+            Long last = lastTaskUpdatedAt.get(taskId);
+            if (last != null && now - last < TASK_UPDATED_THROTTLE_MS) {
+                return;
+            }
+            lastTaskUpdatedAt.put(taskId, now);
+        } else if (event.getType() == DownloadEvent.EventType.TASK_REMOVED
+                && event.getTask() != null) {
+            // 任务移除后清理节流时间戳，避免长期运行时的无效键
+            lastTaskUpdatedAt.remove(event.getTask().getId());
+        }
         for (DownloadListener listener : downloadListeners) {
             try {
                 listener.onDownloadEvent(event);
             } catch (Exception e) {
                 // 捕获监听器异常，避免影响其他监听器
-                System.err.println("监听器处理事件时出现异常: " + e.getMessage());
+                AppLogger.warn("监听器处理事件时出现异常: " + e.getMessage());
             }
         }
     }
@@ -91,7 +116,7 @@ public class EventBus {
                 listener.onConfigChange(event);
             } catch (Exception e) {
                 // 捕获监听器异常，避免影响其他监听器
-                System.err.println("配置监听器处理事件时出现异常: " + e.getMessage());
+                AppLogger.warn("配置监听器处理事件时出现异常: " + e.getMessage());
             }
         }
     }

@@ -40,14 +40,18 @@ public abstract class AbstractConnectionPool<T> implements ConnectionPool<T> {
         if (closed) {
             throw new IllegalStateException("Connection pool is closed");
         }
-        
-        // 尝试从空闲连接队列获取
-        T connection = idleConnections.poll();
-        if (connection != null && isValid(connection)) {
-            activeConnections.incrementAndGet();
-            return connection;
+
+        // 先消耗空闲队列中的有效连接；校验失败的连接必须关闭丢弃，
+        // 否则死连接既占队列额度又泄漏底层 socket/session
+        T connection;
+        while ((connection = idleConnections.poll()) != null) {
+            if (isValid(connection)) {
+                activeConnections.incrementAndGet();
+                return connection;
+            }
+            closeConnection(connection);
         }
-        
+
         // 如果没有空闲连接且未达到最大连接数，创建新连接
         if (activeConnections.get() < maxConnections) {
             if (activeConnections.incrementAndGet() <= maxConnections) {
@@ -61,14 +65,17 @@ public abstract class AbstractConnectionPool<T> implements ConnectionPool<T> {
                 activeConnections.decrementAndGet();
             }
         }
-        
-        // 等待空闲连接
+
+        // 等待空闲连接（等待到的连接同样要先校验，无效直接关闭）
         connection = idleConnections.poll(30, java.util.concurrent.TimeUnit.SECONDS);
-        if (connection != null && isValid(connection)) {
-            activeConnections.incrementAndGet();
-            return connection;
+        if (connection != null) {
+            if (isValid(connection)) {
+                activeConnections.incrementAndGet();
+                return connection;
+            }
+            closeConnection(connection);
         }
-        
+
         throw new Exception("No available connections");
     }
     

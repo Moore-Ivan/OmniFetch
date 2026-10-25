@@ -2,6 +2,7 @@ package com.downloader.config;
 
 import com.downloader.event.ConfigChangeEvent;
 import com.downloader.event.EventBus;
+import com.downloader.util.AppLogger;
 import java.io.IOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
@@ -99,8 +100,9 @@ public class ConfigManager {
         number("下载配置", "download.flushIntervalMs", "磁盘刷新间隔", "毫秒", 1_000, 120_000, 1_000, 10_000);
         number("下载配置", "download.maxRetryCount", "失败自动重试次数", "次", 0, 10, 1, 3);
         number("下载配置", "download.m3u8Concurrent", "M3U8分片并发数", "个", 1, 16, 1, 8);
+        number("下载配置", "download.globalSpeedLimitKB", "全局下载限速（0为不限速）", "KB/s", 0, 1_048_576, 64, 0);
         bool("下载配置", "download.autoOpenFolder", "完成后自动打开目录", false);
-        directory("下载配置", "download.defaultSaveDir", "默认保存路径", "downloads");
+        directory("下载配置", "download.defaultSaveDir", "保存路径", "downloads");
         // HTTP配置
         number("HTTP配置", "http.maxThreads", "HTTP最大线程数", "个", 1, 128, 1, 16);
         number("HTTP配置", "http.minChunkSize", "最小分片大小", "字节", 65_536, 104_857_600, 65_536, 5_242_880);
@@ -119,7 +121,12 @@ public class ConfigManager {
     }
 
     private static ConfigManager instance;
-    private final Map<String, Object> configMap;
+    /**
+     * 配置快照：volatile + 整体替换。
+     * 重载发生在 config-watcher 线程，读取散布在下载线程/EDT——
+     * 若用 clear+put 原地更新，其他线程可能看到半更新（键缺失/新旧混杂）状态
+     */
+    private volatile Map<String, Object> configMap;
     private final ScheduledExecutorService scheduler;
     private long lastModifiedTime;
     private Path configPath;
@@ -161,12 +168,12 @@ public class ConfigManager {
             if (!Files.exists(propsPath)) {
                 Files.createDirectories(propsPath.getParent());
                 writeConfigFile(propsPath, defaultProperties());
-                System.out.println("未找到配置文件，已生成默认配置: " + propsPath.toAbsolutePath());
+                AppLogger.info("未找到配置文件，已生成默认配置: " + propsPath.toAbsolutePath());
             }
             loadPropertiesConfig(propsPath);
             configPath = propsPath;
         } catch (Exception e) {
-            System.err.println("初始化配置文件失败，改用内存默认配置: " + e.getMessage());
+            AppLogger.warn("初始化配置文件失败，改用内存默认配置: " + e.getMessage());
             loadDefaultConfig();
         }
     }
@@ -178,14 +185,16 @@ public class ConfigManager {
         try (java.io.Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
             Properties props = new Properties();
             props.load(reader);
-            configMap.clear();
+            Map<String, Object> snapshot = new HashMap<>();
             for (String key : props.stringPropertyNames()) {
-                configMap.put(key, props.getProperty(key));
+                snapshot.put(key, props.getProperty(key));
             }
+            // 构建完整快照后整体替换引用，读取线程要么看旧值要么看新值
+            configMap = snapshot;
             lastModifiedTime = Files.getLastModifiedTime(path).toMillis();
-            System.out.println("加载配置文件: " + path);
+            AppLogger.info("加载配置文件: " + path);
         } catch (Exception e) {
-            System.err.println("加载配置文件失败: " + e.getMessage());
+            AppLogger.warn("加载配置文件失败: " + e.getMessage());
             loadDefaultConfig();
         }
     }
@@ -194,10 +203,11 @@ public class ConfigManager {
      * 加载默认配置（兜底，正常流程下启动时已生成配置文件）
      */
     private void loadDefaultConfig() {
-        configMap.clear();
+        Map<String, Object> snapshot = new HashMap<>();
         for (ConfigItem item : ITEMS) {
-            configMap.put(item.key, item.defaultValue);
+            snapshot.put(item.key, item.defaultValue);
         }
+        configMap = snapshot;
         configPath = Paths.get("config", "application.properties");
     }
 
@@ -289,13 +299,13 @@ public class ConfigManager {
                 try {
                     long currentModifiedTime = Files.getLastModifiedTime(configPath).toMillis();
                     if (currentModifiedTime > lastModifiedTime) {
-                        System.out.println("配置文件已更新，重新加载...");
+                        AppLogger.info("配置文件已更新，重新加载...");
                         loadPropertiesConfig(configPath);
                         EventBus.getInstance().publishConfigChangeEvent(
                                 new ConfigChangeEvent(configPath.toString()));
                     }
                 } catch (Exception e) {
-                    System.err.println("监控配置文件失败: " + e.getMessage());
+                    AppLogger.warn("监控配置文件失败: " + e.getMessage());
                 }
             }
         }, 5, 5, TimeUnit.SECONDS);

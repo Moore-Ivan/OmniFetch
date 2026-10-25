@@ -15,6 +15,8 @@ public class BencodeParser {
 
     private final byte[] data;
     private int pos;
+    /** 当前嵌套深度：顶层字典/列表进入后为 1，每嵌套一层加 1 */
+    private int depth;
     /** info 字典在原始字节中的区间 [infoStart, infoEnd)，用于计算 info_hash；只记录首个顶层 info */
     private int infoStart = -1;
     private int infoEnd = -1;
@@ -27,6 +29,7 @@ public class BencodeParser {
     public Map<String, Object> readDict() {
         expect('d');
         pos++; // skip 'd'
+        depth++;
 
         Map<String, Object> map = new LinkedHashMap<>();
         while (true) {
@@ -35,12 +38,13 @@ public class BencodeParser {
             }
             if (data[pos] == 'e') {
                 pos++; // skip 'e'
+                depth--;
                 return map;
             }
             String key = readKeyString();
-            // 仅记录第一个 info 键（顶层 info 先于其内部嵌套字典被解析），
-            // 避免嵌套字典中同名键覆盖 info_hash 区间
-            boolean captureInfo = "info".equals(key) && infoStart < 0;
+            // 仅记录顶层字典中的首个 info 键（depth==1）：嵌套结构里可能存在
+            // 同名 info 键，若不限定深度，info_hash 区间会被嵌套值污染
+            boolean captureInfo = "info".equals(key) && infoStart < 0 && depth == 1;
             if (captureInfo) {
                 infoStart = pos;
             }
@@ -55,6 +59,7 @@ public class BencodeParser {
     public List<Object> readList() {
         expect('l');
         pos++; // skip 'l'
+        depth++;
         List<Object> list = new ArrayList<>();
         while (true) {
             if (pos >= data.length) {
@@ -62,6 +67,7 @@ public class BencodeParser {
             }
             if (data[pos] == 'e') {
                 pos++; // skip 'e'
+                depth--;
                 return list;
             }
             list.add(readValue());

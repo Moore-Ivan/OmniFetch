@@ -2,6 +2,7 @@ package com.downloader.manager;
 
 import com.downloader.model.DownloadTask;
 import com.downloader.model.Protocol;
+import com.downloader.util.AppLogger;
 import com.downloader.util.MiniJson;
 
 import java.io.IOException;
@@ -73,7 +74,7 @@ public class HistoryStore {
         try {
             saveNow(tasksSupplier.get());
         } catch (Exception e) {
-            System.err.println("保存历史下载记录失败: " + e.getMessage());
+            AppLogger.warn("保存历史下载记录失败: " + e.getMessage());
         }
     }
 
@@ -84,7 +85,7 @@ public class HistoryStore {
         try {
             saveNow(tasksSupplier.get());
         } catch (Exception e) {
-            System.err.println("退出时保存历史下载记录失败: " + e.getMessage());
+            AppLogger.warn("退出时保存历史下载记录失败: " + e.getMessage());
         }
     }
 
@@ -105,7 +106,7 @@ public class HistoryStore {
         try {
             json = Files.readString(file, StandardCharsets.UTF_8);
         } catch (IOException e) {
-            System.err.println("读取历史下载记录失败: " + e.getMessage());
+            AppLogger.warn("读取历史下载记录失败: " + e.getMessage());
             return List.of();
         }
         if (json.isBlank()) {
@@ -135,12 +136,12 @@ public class HistoryStore {
 
     /** 损坏文件备份后重建空历史（备份失败时删除原文件，避免每次启动都报损坏） */
     private void backupCorruptedFile() {
-        System.err.println("历史下载记录文件损坏: " + file);
+        AppLogger.warn("历史下载记录文件损坏: " + file);
         Path bad = file.resolveSibling("history.json.bad-"
                 + LocalDateTime.now().toString().replace(':', '-'));
         try {
             Files.move(file, bad, StandardCopyOption.REPLACE_EXISTING);
-            System.err.println("已备份损坏文件为: " + bad.getFileName());
+            AppLogger.warn("已备份损坏文件为: " + bad.getFileName());
         } catch (IOException e) {
             try {
                 Files.deleteIfExists(file);

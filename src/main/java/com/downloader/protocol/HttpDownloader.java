@@ -2,8 +2,11 @@ package com.downloader.protocol;
 
 import com.downloader.config.ConfigManager;
 import com.downloader.model.ProgressCallback;
+import com.downloader.util.AppLogger;
 import com.downloader.util.FileUtils;
 import com.downloader.util.HttpTrust;
+import com.downloader.util.RateLimiter;
+import com.downloader.util.UpdateDownloader;
 import java.io.*;
 import java.net.*;
 import java.net.http.*;
@@ -35,6 +38,8 @@ public class HttpDownloader implements DownloadProtocol {
     private List<Future<?>> downloadFutures;
     private long downloadedSize = 0;
     private String saveFilePath;
+    /** 任务级限速器（字节/秒，0=不限）；可为 null（插件/旧构造通道） */
+    private final RateLimiter limiter;
 
     private final ConfigManager configManager = ConfigManager.getInstance();
     
@@ -73,26 +78,28 @@ public class HttpDownloader implements DownloadProtocol {
 
     public HttpDownloader(String fileURL, String savePath,
                           ProgressCallback callback) {
-        this.fileURL = fileURL;
-        this.savePath = savePath;
-        this.callback = callback;
+        this(fileURL, savePath, callback, 0, null, null);
     }
 
     public HttpDownloader(String fileURL, String savePath,
                           ProgressCallback callback, long downloadedSize) {
-        this.fileURL = fileURL;
-        this.savePath = savePath;
-        this.callback = callback;
-        this.downloadedSize = downloadedSize;
+        this(fileURL, savePath, callback, downloadedSize, null, null);
     }
 
     public HttpDownloader(String fileURL, String savePath,
                           ProgressCallback callback, long downloadedSize, String saveFilePath) {
+        this(fileURL, savePath, callback, downloadedSize, saveFilePath, null);
+    }
+
+    public HttpDownloader(String fileURL, String savePath,
+                          ProgressCallback callback, long downloadedSize, String saveFilePath,
+                          RateLimiter limiter) {
         this.fileURL = fileURL;
         this.savePath = savePath;
         this.callback = callback;
         this.downloadedSize = downloadedSize;
         this.saveFilePath = saveFilePath;
+        this.limiter = limiter;
     }
 
     @Override
@@ -119,6 +126,8 @@ public class HttpDownloader implements DownloadProtocol {
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
                 .header("Accept", "*/*")
+                // 显式要求不压缩传输：压缩响应会让落盘内容与原始文件不一致
+                .header("Accept-Encoding", "identity")
                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                 .build();
 
@@ -135,19 +144,64 @@ public class HttpDownloader implements DownloadProtocol {
             return;
         }
 
-        if (headResponse.statusCode() != 200) {
-            throw new IOException("HTTP " + headResponse.statusCode());
-        }
+        String fileName;
+        long totalSize;
+        boolean supportRange;
+        HttpClient.Version version;
 
-        String fileName = FileUtils.extractFileName(
-                headResponse.headers().firstValue("Content-Disposition").orElse(null),
-                fileURL);
-        long totalSize = headResponse.headers()
-                .firstValueAsLong("Content-Length").orElse(-1);
+        if (headResponse.statusCode() >= 200 && headResponse.statusCode() < 300) {
+            fileName = FileUtils.extractFileName(
+                    headResponse.headers().firstValue("Content-Disposition").orElse(null),
+                    fileURL);
+            totalSize = headResponse.headers()
+                    .firstValueAsLong("Content-Length").orElse(-1);
+            // 仅 Accept-Ranges: bytes 视为支持续传（缺失或 none 都按不支持处理）
+            supportRange = headResponse.headers().firstValue("Accept-Ranges")
+                    .map(v -> v.trim().equalsIgnoreCase("bytes"))
+                    .orElse(false);
+            version = headResponse.version();
+        } else {
+            // HEAD 被拒（部分服务器对 HEAD 返回 403/405，但 GET 完全可用）：
+            // 退化用 GET bytes=0-0 探测文件名/大小/Range 支持
+            HttpResponse<InputStream> probe = httpClient.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(fileURL))
+                            .header("User-Agent", getUserAgent())
+                            .header("Accept", "*/*")
+                            .header("Accept-Encoding", "identity")
+                            .header("Range", "bytes=0-0")
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.ofInputStream());
+            try (InputStream probeBody = probe.body()) {
+                if (cancelled) {
+                    return;
+                }
+                int code = probe.statusCode();
+                if (code == 206) {
+                    supportRange = true;
+                    totalSize = UpdateDownloader.parseTotalFromContentRange(
+                            probe.headers().firstValue("Content-Range").orElse(null));
+                    if (totalSize <= 0) {
+                        totalSize = probe.headers().firstValueAsLong("Content-Length").orElse(-1);
+                    }
+                } else if (code >= 200 && code < 300) {
+                    supportRange = false;
+                    totalSize = probe.headers().firstValueAsLong("Content-Length").orElse(-1);
+                } else {
+                    throw new IOException("HTTP " + headResponse.statusCode()
+                            + "（HEAD）/ " + code + "（GET 探测）");
+                }
+                fileName = FileUtils.extractFileName(
+                        probe.headers().firstValue("Content-Disposition").orElse(null),
+                        fileURL);
+                version = probe.version();
+            }
+        }
 
         callback.onConnected(fileName, totalSize);
         callback.onStatusUpdate("HTTP/"
-                + (headResponse.version() == HttpClient.Version.HTTP_2 ? "2" : "1.1"));
+                + (version == HttpClient.Version.HTTP_2 ? "2" : "1.1"));
 
         File saveFile;
         if (saveFilePath != null && !saveFilePath.isEmpty()) {
@@ -155,10 +209,10 @@ public class HttpDownloader implements DownloadProtocol {
         } else {
             saveFile = FileUtils.buildSaveFile(savePath, fileName);
         }
+        // 重名避让后的真实落盘路径回报给任务（续传/打开文件都以它为准）
+        callback.onSaveFile(saveFile);
 
         // 检查是否支持 Range 请求
-        boolean supportRange = headResponse.headers().firstValue("Accept-Ranges").isPresent();
-
         if (supportRange && totalSize > 0) {
             // 使用多线程分段下载
             downloadWithMultipleThreads(saveFile, totalSize);
@@ -200,9 +254,9 @@ public class HttpDownloader implements DownloadProtocol {
             chunkSize = determineChunkSize(testSpeed, totalSize, threadCount);
             chunkDone = new long[threadCount];
 
-            System.out.println("连接速度测试: " + FileUtils.formatSize(testSpeed) + "/s");
-            System.out.println("使用线程数: " + threadCount);
-            System.out.println("分片大小: " + FileUtils.formatSize(chunkSize));
+            AppLogger.info("连接速度测试: " + FileUtils.formatSize(testSpeed) + "/s"
+                    + "，使用线程数: " + threadCount
+                    + "，分片大小: " + FileUtils.formatSize(chunkSize));
         } else {
             threadCount = resume.threadCount;
             chunkSize = resume.chunkSize;
@@ -210,7 +264,7 @@ public class HttpDownloader implements DownloadProtocol {
 
             long resumed = 0;
             for (long d : chunkDone) resumed += d;
-            System.out.println("断点续传: 线程数=" + threadCount
+            AppLogger.info("断点续传: 线程数=" + threadCount
                     + "，分片大小=" + FileUtils.formatSize(chunkSize)
                     + "，已下载=" + FileUtils.formatSize(resumed));
         }
@@ -260,7 +314,7 @@ public class HttpDownloader implements DownloadProtocol {
                     } catch (Exception e) {
                         failedChunks.incrementAndGet();
                         if (!cancelled) {
-                            System.err.println("分片 " + threadIndex + " 下载失败: " + e.getMessage());
+                            AppLogger.warn("分片 " + threadIndex + " 下载失败: " + e.getMessage());
                         }
                     }
                 });
@@ -328,7 +382,7 @@ public class HttpDownloader implements DownloadProtocol {
         // 全部完成并校验通过后删除续传元数据；
         // 只有取消/失败时才保留，供下一次任务从断点继续
         if (metaFile.exists() && !metaFile.delete()) {
-            System.err.println("无法删除续传元数据文件: " + metaFile.getAbsolutePath());
+            AppLogger.warn("无法删除续传元数据文件: " + metaFile.getAbsolutePath());
         }
     }
     
@@ -344,27 +398,32 @@ public class HttpDownloader implements DownloadProtocol {
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
                 .header("Accept", "*")
+                .header("Accept-Encoding", "identity")
                 .header("Range", "bytes=0-2097151") // 测试2MB，增加测试数据量
                 .GET()
                 .build();
-        
+
         HttpResponse<InputStream> response = httpClient.send(testRequest, HttpResponse.BodyHandlers.ofInputStream());
-        
-        if (response.statusCode() == 206) {
-            try (InputStream in = response.body()) {
-                byte[] buffer = new byte[16384]; // 增大测试缓冲区
-                int read;
-                long endTime = startTime + testDuration;
-                
-                while (System.currentTimeMillis() < endTime && (read = in.read(buffer)) != -1) {
-                    bytesRead += read;
-                }
+
+        // 非 206（如服务器不支持 Range 返回 200/403）也必须关闭响应体，避免连接泄漏
+        if (response.statusCode() != 206) {
+            response.body().close();
+            return 0;
+        }
+
+        try (InputStream in = response.body()) {
+            byte[] buffer = new byte[16384]; // 增大测试缓冲区
+            int read;
+            long endTime = startTime + testDuration;
+
+            while (System.currentTimeMillis() < endTime && (read = in.read(buffer)) != -1) {
+                bytesRead += read;
             }
         }
-        
+
         long elapsedTime = System.currentTimeMillis() - startTime;
         if (elapsedTime == 0) elapsedTime = 1;
-        
+
         return (bytesRead * 1000) / elapsedTime;
     }
     
@@ -432,6 +491,7 @@ public class HttpDownloader implements DownloadProtocol {
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
                 .header("Accept", "*/*")
+                .header("Accept-Encoding", "identity")
                 .header("Range", "bytes=" + requestStart + "-" + end)
                 .GET()
                 .build();
@@ -455,12 +515,12 @@ public class HttpDownloader implements DownloadProtocol {
 
         try (InputStream in = response.body();
              FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE);
-             ReadableByteChannel inChannel = Channels.newChannel(in)) {
+             ReadableByteChannel inChannel = Channels.newChannel(in);
+             StallWatchdog watchdog = new StallWatchdog(in)) {
 
             long currentPosition = requestStart;
             long transferredTotal = 0;
             long lastPersisted = 0;
-            long lastActivityTime = System.currentTimeMillis();
             long lastFlushTime = System.currentTimeMillis();
 
             while (transferredTotal < expected) {
@@ -469,43 +529,94 @@ public class HttpDownloader implements DownloadProtocol {
                     persist.run();
                     return;
                 }
-                if (in.available() > 0) {
-                    // 零拷贝传输数据
-                    long transferred = fileChannel.transferFrom(
-                            inChannel, currentPosition, getBufferSize());
+                // 阻塞式传输：不依赖 available()（部分 JDK/HTTP 实现长期返回 0，
+                // 会导致空转误报）。连接停滞由看门狗负责——持续 30 秒无数据时
+                // 关闭输入流解除阻塞，此处抛错触发统一重试
+                long transferred = fileChannel.transferFrom(
+                        inChannel, currentPosition, getBufferSize());
 
-                    if (transferred == 0) {
-                        throw new IOException("数据流意外提前结束");
-                    }
+                if (transferred == 0) {
+                    throw new IOException("数据流意外提前结束");
+                }
 
-                    downloadedTotal.addAndGet(transferred);
-                    currentPosition += transferred;
-                    transferredTotal += transferred;
-                    lastActivityTime = System.currentTimeMillis();
-                    progress.accept(transferredTotal);
+                downloadedTotal.addAndGet(transferred);
+                currentPosition += transferred;
+                transferredTotal += transferred;
+                watchdog.activity();
 
-                    // 每推进约 1MB 刷一次续传元数据（崩溃最多回退 1MB）
-                    if (transferredTotal - lastPersisted >= 1024 * 1024) {
-                        persist.run();
-                        lastPersisted = transferredTotal;
-                    }
+                // 限速：分片共享同一限速器，总速率被钳制在配额内（不限速时空操作）
+                RateLimiter.acquire(limiter, transferred);
 
-                    // 按照配置的间隔刷新缓冲区
-                    if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
-                        fileChannel.force(true); // 强制刷新到磁盘
-                        lastFlushTime = System.currentTimeMillis();
-                    }
-                } else {
-                    // 超过 30 秒没有任何数据视为连接停滞，抛错触发重试
-                    if (System.currentTimeMillis() - lastActivityTime > 30_000) {
-                        throw new IOException("连接 30 秒无数据");
-                    }
-                    Thread.sleep(10);
+                progress.accept(transferredTotal);
+
+                // 每推进约 1MB 刷一次续传元数据（崩溃最多回退 1MB）；
+                // 元数据记录的是分片完成字节数，必须先 force 落盘数据再写元数据，
+                // 否则崩溃后元数据"领先"磁盘造成续传文件出现空洞
+                if (transferredTotal - lastPersisted >= 1024 * 1024) {
+                    fileChannel.force(true);
+                    persist.run();
+                    lastPersisted = transferredTotal;
+                }
+
+                // 按照配置的间隔刷新缓冲区
+                if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
+                    fileChannel.force(true); // 强制刷新到磁盘
+                    lastFlushTime = System.currentTimeMillis();
                 }
             }
-            // 分片完整收尾：强制落盘并标记元数据
+            // 分片完整收尾：先强制落盘数据，再标记元数据（顺序不可颠倒）
             fileChannel.force(true);
             persist.run();
+        }
+    }
+
+    /**
+     * 读取停滞看门狗：HttpClient 的响应流没有读超时，服务器假死时
+     * 阻塞中的 transferFrom 永远不会返回。看门狗持续监测最后活跃时间，
+     * 超过阈值即关闭输入流，使阻塞中的读取立即抛出 IOException 触发重试。
+     */
+    private final class StallWatchdog implements AutoCloseable {
+
+        private static final long STALL_TIMEOUT_MS = 30_000;
+
+        private final InputStream stream;
+        private final AtomicLong lastActivity = new AtomicLong(System.currentTimeMillis());
+        private volatile boolean stopped = false;
+        private final Thread thread;
+
+        StallWatchdog(InputStream stream) {
+            this.stream = stream;
+            thread = new Thread(this::watch, "http-stall-watchdog");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        /** 每次成功读到数据时调用，重置停滞计时 */
+        void activity() {
+            lastActivity.set(System.currentTimeMillis());
+        }
+
+        private void watch() {
+            while (!stopped) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (System.currentTimeMillis() - lastActivity.get() > STALL_TIMEOUT_MS) {
+                    try {
+                        stream.close(); // 解除阻塞中的 read/transferFrom
+                    } catch (IOException ignored) {
+                    }
+                    return;
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            stopped = true;
+            thread.interrupt();
         }
     }
 
@@ -521,7 +632,8 @@ public class HttpDownloader implements DownloadProtocol {
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
-                .header("Accept", "*/*");
+                .header("Accept", "*/*")
+                .header("Accept-Encoding", "identity");
         if (start > 0) {
             // 支持断点续传，发送Range请求
             builder.header("Range", "bytes=" + start + "-");
@@ -544,7 +656,7 @@ public class HttpDownloader implements DownloadProtocol {
             response.body().close();
             throw new IOException("HTTP " + response.statusCode() + "（续传请求期望 206）");
         }
-        if (start == 0 && response.statusCode() != 200) {
+        if (start == 0 && response.statusCode() != 200 && response.statusCode() != 206) {
             response.body().close();
             throw new IOException("HTTP " + response.statusCode());
         }
@@ -559,12 +671,12 @@ public class HttpDownloader implements DownloadProtocol {
 
         try (InputStream in = response.body();
              FileChannel fileChannel = FileChannel.open(saveFile.toPath(), WRITE, CREATE);
-             ReadableByteChannel inChannel = Channels.newChannel(in)) {
+             ReadableByteChannel inChannel = Channels.newChannel(in);
+             StallWatchdog watchdog = new StallWatchdog(in)) {
 
             long downloaded = start;
             long lastTime = System.currentTimeMillis();
             long lastBytes = start;
-            long lastActivityTime = System.currentTimeMillis();
             long lastFlushTime = System.currentTimeMillis();
 
             while (!cancelled) {
@@ -572,38 +684,34 @@ public class HttpDownloader implements DownloadProtocol {
                 if (totalSize > 0 && downloaded >= totalSize) {
                     break;
                 }
-                if (in.available() > 0) {
-                    // 零拷贝传输数据
-                    long transferred = fileChannel.transferFrom(
-                            inChannel, downloaded, getBufferSize());
+                // 阻塞式传输：不依赖 available()；停滞与假死由看门狗解除
+                long transferred = fileChannel.transferFrom(
+                        inChannel, downloaded, getBufferSize());
 
-                    if (transferred == 0) {
-                        break; // 服务器关闭连接，数据流结束
-                    }
+                if (transferred == 0) {
+                    // 服务器正常关闭连接，数据流结束（总大小未知时以此判断完成）
+                    break;
+                }
 
-                    downloaded += transferred;
-                    lastActivityTime = System.currentTimeMillis();
+                downloaded += transferred;
+                watchdog.activity();
 
-                    // 按照配置的间隔刷新缓冲区
-                    if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
-                        fileChannel.force(true); // 强制刷新到磁盘
-                        lastFlushTime = System.currentTimeMillis();
-                    }
+                // 限速：按本次传输字节数获取令牌（不限速时空操作）
+                RateLimiter.acquire(limiter, transferred);
 
-                    long now = System.currentTimeMillis();
-                    if (now - lastTime >= getProgressIntervalMs()) {
-                        long speed = (long) ((downloaded - lastBytes)
-                                * 1000.0 / (now - lastTime));
-                        callback.onProgress(downloaded, totalSize, speed);
-                        lastTime = now;
-                        lastBytes = downloaded;
-                    }
-                } else {
-                    // 超过 30 秒没有任何数据视为连接停滞，抛错触发重试
-                    if (System.currentTimeMillis() - lastActivityTime > 30_000) {
-                        throw new IOException("连接 30 秒无数据");
-                    }
-                    Thread.sleep(10);
+                // 按照配置的间隔刷新缓冲区
+                if (System.currentTimeMillis() - lastFlushTime > getFlushIntervalMs()) {
+                    fileChannel.force(true); // 强制刷新到磁盘
+                    lastFlushTime = System.currentTimeMillis();
+                }
+
+                long now = System.currentTimeMillis();
+                if (now - lastTime >= getProgressIntervalMs()) {
+                    long speed = (long) ((downloaded - lastBytes)
+                            * 1000.0 / (now - lastTime));
+                    callback.onProgress(downloaded, totalSize, speed);
+                    lastTime = now;
+                    lastBytes = downloaded;
                 }
             }
 
@@ -691,7 +799,7 @@ public class HttpDownloader implements DownloadProtocol {
         } catch (IOException e) {
             // 元数据写失败不致命：最坏情况是下次从头重下，不影响本次数据正确性
             tmp.delete();
-            System.err.println("续传元数据写入失败: " + e.getMessage());
+            AppLogger.warn("续传元数据写入失败: " + e.getMessage());
             return;
         }
         // 必须用 Files.move(REPLACE_EXISTING) 而非 File.renameTo：
@@ -707,11 +815,11 @@ public class HttpDownloader implements DownloadProtocol {
                         StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException fallback) {
                 tmp.delete();
-                System.err.println("续传元数据替换失败: " + metaFile.getAbsolutePath());
+                AppLogger.warn("续传元数据替换失败: " + metaFile.getAbsolutePath());
             }
         } catch (IOException e) {
             tmp.delete();
-            System.err.println("续传元数据替换失败: " + metaFile.getAbsolutePath());
+            AppLogger.warn("续传元数据替换失败: " + metaFile.getAbsolutePath());
         }
     }
 

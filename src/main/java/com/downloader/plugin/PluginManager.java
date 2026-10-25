@@ -2,6 +2,7 @@ package com.downloader.plugin;
 
 import com.downloader.config.ConfigManager;
 import com.downloader.protocol.DownloadProtocol;
+import com.downloader.util.AppLogger;
 
 import java.io.File;
 import java.net.URL;
@@ -51,7 +52,7 @@ public class PluginManager {
         ServiceLoader<ProtocolPlugin> loader = ServiceLoader.load(ProtocolPlugin.class);
         for (ProtocolPlugin plugin : loader) {
             plugins.add(plugin);
-            System.out.println("加载插件: " + plugin.getName() + " (支持协议: " + plugin.getProtocolName() + ")");
+            AppLogger.info("加载插件: " + plugin.getName() + " (支持协议: " + plugin.getProtocolName() + ")");
         }
     }
     
@@ -72,16 +73,19 @@ public class PluginManager {
                         boolean found = false;
                         for (ProtocolPlugin plugin : loader) {
                             plugins.add(plugin);
-                            classLoaders.add(classLoader);
                             found = true;
-                            System.out.println("加载插件: " + plugin.getName() + " (支持协议: " + plugin.getProtocolName() + ")");
+                            AppLogger.info("加载插件: " + plugin.getName() + " (支持协议: " + plugin.getProtocolName() + ")");
                         }
-                        if (!found) {
+                        if (found) {
+                            // 同一 jar 只登记一次 classLoader（一个 jar 可含多个插件实现，
+                            // 重复登记会导致刷新/关闭时对同一 loader 反复 close）
+                            classLoaders.add(classLoader);
+                        } else {
                             // jar 中没有插件实现，及时释放 classLoader
                             classLoader.close();
                         }
                     } catch (Exception e) {
-                        System.err.println("加载插件失败: " + jar.getName() + ", 错误: " + e.getMessage());
+                        AppLogger.warn("加载插件失败: " + jar.getName() + ", 错误: " + e.getMessage());
                         // 加载失败的 jar 关闭 classLoader，避免资源泄漏
                         if (classLoader != null) {
                             try {

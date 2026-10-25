@@ -225,19 +225,33 @@ public class ConfigDialog extends JDialog {
                 groupPanel.add(checkBox, gbc);
             }
             case STRING -> {
-                JTextField textField = new JTextField(
-                        configManager.getString(item.key, item.defaultValue), item.directory ? 16 : 14);
-                textField.setToolTipText("默认值：" + (item.defaultValue.isEmpty() ? "（空）" : item.defaultValue));
+                // 目录路径型（保存路径）：直接显示解析后的实际保存路径（与主界面一致），
+                // 而非配置原文（默认为相对值 downloads）；仍可直接编辑
+                String initial = item.directory
+                        ? MainWindow.resolveDefaultSaveDir()
+                        : configManager.getString(item.key, item.defaultValue);
+                JTextField textField = new JTextField(initial, 14);
+                textField.setToolTipText(item.directory
+                        ? "默认值：" + item.defaultValue + "（相对路径按程序根目录解析）"
+                        : "默认值：" + (item.defaultValue.isEmpty() ? "（空）" : item.defaultValue));
                 textFields.put(item, textField);
                 if (item.directory) {
-                    // 目录路径型：输入框 + 浏览按钮组合，点击弹出系统目录选择器
-                    JPanel pathPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-                    pathPanel.add(textField);
+                    // 绝对路径较长，与标签同行放不下：字段换到标签下一行独占整行，
+                    // 占满分组面板宽度（REMAINDER + 水平拉伸），单行即可显示完整路径
+                    JPanel pathPanel = new JPanel(new BorderLayout(6, 0));
+                    pathPanel.add(textField, BorderLayout.CENTER);
                     JButton browseBtn = new JButton("浏览…", UiIcons.folder());
                     browseBtn.setFocusable(false);
                     browseBtn.setToolTipText("浏览并选择目录");
                     browseBtn.addActionListener(e -> chooseDirectory(textField));
-                    pathPanel.add(browseBtn);
+                    pathPanel.add(browseBtn, BorderLayout.EAST);
+
+                    gbc.gridy = nextRow(groupPanel); // 标签独占上一行，字段另起一行
+                    gbc.gridx = 0;
+                    gbc.gridwidth = GridBagConstraints.REMAINDER;
+                    gbc.fill = GridBagConstraints.HORIZONTAL;
+                    gbc.weightx = 1;
+                    gbc.insets = new Insets(0, 6, 6, 6); // 紧贴标签行，间距由标签行底部提供
                     groupPanel.add(pathPanel, gbc);
                 } else {
                     groupPanel.add(textField, gbc);
@@ -311,7 +325,7 @@ public class ConfigDialog extends JDialog {
      */
     private void chooseDirectory(JTextField target) {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("选择默认保存路径");
+        chooser.setDialogTitle("选择保存路径");
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         chooser.setAcceptAllFileFilterUsed(false);
         File current = new File(target.getText().trim());

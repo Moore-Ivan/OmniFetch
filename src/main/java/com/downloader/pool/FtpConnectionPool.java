@@ -25,9 +25,10 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
     private final String pass;
     private final int connectTimeoutMs;
     
-    // 存储连接的创建时间，用于清理超时连接
-    private final ConcurrentMap<FtpConnection, Long> connectionCreationTimes;
-    
+    // 存储连接的最后使用时间，用于清理空闲超时的连接
+    // （此前按"创建时间"清理，刚归还的活跃连接也可能被立刻清掉）
+    private final ConcurrentMap<FtpConnection, Long> connectionLastUsedTimes;
+
     public FtpConnectionPool(String host, int port, String user, String pass) {
         super();
         this.host = host;
@@ -36,31 +37,58 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
         this.pass = pass;
         ConfigManager configManager = ConfigManager.getInstance();
         this.connectTimeoutMs = configManager.getInt("ftp.connectionTimeoutSec", 30) * 1000;
-        this.connectionCreationTimes = new ConcurrentHashMap<>();
+        this.connectionLastUsedTimes = new ConcurrentHashMap<>();
     }
-    
+
+    /** 归还连接时刷新最后使用时间，避免活跃连接被空闲清理误杀 */
+    @Override
+    public void releaseConnection(FtpConnection connection) {
+        if (connection != null) {
+            connectionLastUsedTimes.put(connection, System.currentTimeMillis());
+        }
+        super.releaseConnection(connection);
+    }
+
     @Override
     protected void cleanupIdleConnections() {
         long now = System.currentTimeMillis();
         for (FtpConnection connection : idleConnections) {
-            Long createTime = connectionCreationTimes.get(connection);
-            if (createTime != null && now - createTime > idleTimeoutMs) {
+            Long lastUsed = connectionLastUsedTimes.get(connection);
+            if (lastUsed != null && now - lastUsed > idleTimeoutMs) {
                 if (idleConnections.remove(connection)) {
                     closeConnection(connection);
-                    connectionCreationTimes.remove(connection);
                 }
             }
         }
     }
-    
+
+    /** 私网/环回/未指定地址：PASV 返回这类 IP 时应回退用控制连接的对端地址 */
+    static boolean isUnroutableIp(String ip) {
+        String[] octets = ip.split("\\.");
+        if (octets.length != 4) {
+            return true;
+        }
+        try {
+            int a = Integer.parseInt(octets[0]);
+            int b = Integer.parseInt(octets[1]);
+            return a == 0 || a == 10 || a == 127
+                    || (a == 100 && b >= 64 && b <= 127)      // CGNAT
+                    || (a == 169 && b == 254)                 // link-local
+                    || (a == 172 && b >= 16 && b <= 31)       // 私网
+                    || (a == 192 && b == 168);                // 私网
+        } catch (NumberFormatException e) {
+            return true;
+        }
+    }
+
     @Override
     protected FtpConnection createConnection() throws Exception {
         FtpConnection connection = new FtpConnection();
         connection.connect();
-        connectionCreationTimes.put(connection, System.currentTimeMillis());
+        connectionLastUsedTimes.put(connection, System.currentTimeMillis());
         return connection;
     }
-    
+
     @Override
     protected boolean isValid(FtpConnection connection) {
         try {
@@ -74,11 +102,11 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
             return false;
         }
     }
-    
+
     @Override
     protected void closeConnection(FtpConnection connection) {
         if (connection != null) {
-            connectionCreationTimes.remove(connection);
+            connectionLastUsedTimes.remove(connection);
             connection.close();
         }
     }
@@ -112,28 +140,10 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
         }
 
         /**
-         * 发送命令并等待响应，返回最终响应码；不在接受列表内时抛异常（不再静默返回）
-         */
-        public int sendCommand(String cmd, int... acceptedCodes) throws IOException {
-            controlOut.println(cmd);
-            return readResponse(acceptedCodes);
-        }
-        
-        /**
-         * 发送命令并获取响应
-         */
-        public String sendCommandAndGetResponse(String cmd) throws IOException {
-            controlOut.println(cmd);
-            String line = controlIn.readLine();
-            if (line == null) throw new IOException("No response");
-            return line;
-        }
-        
-        /**
-         * 读取一条（可能多行的）FTP 响应，返回最终响应码；
+         * 读取一条（可能多行的）FTP 响应，返回最终响应行（形如 "226 Transfer complete"）；
          * 不在接受列表内的最终码一律抛异常，避免上层在错误状态下继续操作
          */
-        public int readResponse(int... acceptedCodes) throws IOException {
+        public String readResponseLine(int... acceptedCodes) throws IOException {
             String line = null;
             String finalLine = null;
             int code = -1;
@@ -159,47 +169,90 @@ public class FtpConnectionPool extends AbstractConnectionPool<FtpConnectionPool.
             if (finalLine == null) {
                 throw new IOException("FTP 服务器关闭了连接或未返回响应");
             }
+            // 不指定接受码 = 仅取响应行，由调用方自行解析（如 SIZE 的多码响应）
+            if (acceptedCodes.length == 0) {
+                return finalLine;
+            }
             for (int accepted : acceptedCodes) {
                 if (code == accepted) {
-                    return code;
+                    return finalLine;
                 }
             }
             throw new IOException("FTP 响应码异常（期望 "
                     + java.util.Arrays.toString(acceptedCodes)
                     + "，实际 " + code + "）: " + finalLine);
         }
-        
+
         /**
-         * 进入被动模式
+         * 发送命令并等待响应，返回最终响应码；不在接受列表内时抛异常（不再静默返回）
+         */
+        public int sendCommand(String cmd, int... acceptedCodes) throws IOException {
+            controlOut.println(cmd);
+            return readResponse(acceptedCodes);
+        }
+
+        /**
+         * 发送命令并返回最终响应行（不校验响应码，由调用方自行解析）。
+         * 适用于响应码多样的命令（如可选能力 SIZE：213 成功 / 500 不支持）。
+         */
+        public String sendCommandAndGetLine(String cmd) throws IOException {
+            controlOut.println(cmd);
+            return readResponseLine();
+        }
+
+        /**
+         * 读取响应并返回最终响应码
+         */
+        public int readResponse(int... acceptedCodes) throws IOException {
+            String finalLine = readResponseLine(acceptedCodes);
+            try {
+                return Integer.parseInt(finalLine.substring(0, 3));
+            } catch (NumberFormatException e) {
+                throw new IOException("FTP 响应码解析失败: " + finalLine);
+            }
+        }
+
+        /**
+         * 进入被动模式。兼容不带括号的 227 响应与多行响应；
+         * 服务器返回私网/环回 IP（NAT 场景）时回退用控制连接的对端地址。
          */
         public int[] enterPassiveMode() throws IOException {
             controlOut.println("PASV");
-            String line = controlIn.readLine();
-            if (line == null || !line.startsWith("227")) {
-                throw new IOException("PASV failed: " + line);
-            }
-            
-            int start = line.indexOf('(');
-            int end = line.indexOf(')');
-            if (start < 0 || end < 0) {
+            String line = readResponseLine(227);
+
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(\\d{1,3}),(\\d{1,3}),(\\d{1,3}),(\\d{1,3}),(\\d{1,3}),(\\d{1,3})")
+                    .matcher(line);
+            if (!m.find()) {
                 throw new IOException("Cannot parse PASV response: " + line);
             }
-            
-            String[] parts = line.substring(start + 1, end).split(",");
-            if (parts.length != 6) {
-                throw new IOException("Invalid PASV format: " + line);
+
+            int[] octets = new int[4];
+            for (int i = 0; i < 4; i++) {
+                octets[i] = Integer.parseInt(m.group(i + 1));
             }
-            
-            int dataPort = Integer.parseInt(parts[4].trim()) * 256
-                    + Integer.parseInt(parts[5].trim());
-            
-            return new int[]{
-                    Integer.parseInt(parts[0].trim()),
-                    Integer.parseInt(parts[1].trim()),
-                    Integer.parseInt(parts[2].trim()),
-                    Integer.parseInt(parts[3].trim()),
-                    dataPort
-            };
+            int dataPort = Integer.parseInt(m.group(5)) * 256
+                    + Integer.parseInt(m.group(6));
+
+            String dataIp = octets[0] + "." + octets[1] + "."
+                    + octets[2] + "." + octets[3];
+            if (isUnroutableIp(dataIp)) {
+                // NAT 后的私网地址外部不可达：改用控制连接实际对端地址
+                java.net.InetAddress remote = controlSocket != null
+                        ? controlSocket.getInetAddress() : null;
+                if (remote == null) {
+                    throw new IOException("PASV 返回不可路由地址且无法获取控制连接对端地址: " + line);
+                }
+                byte[] addr = remote.getAddress();
+                if (addr.length == 4) {
+                    octets[0] = addr[0] & 0xFF;
+                    octets[1] = addr[1] & 0xFF;
+                    octets[2] = addr[2] & 0xFF;
+                    octets[3] = addr[3] & 0xFF;
+                }
+            }
+
+            return new int[]{octets[0], octets[1], octets[2], octets[3], dataPort};
         }
         
         /**

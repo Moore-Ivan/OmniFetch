@@ -10,6 +10,8 @@ import com.downloader.model.DownloadTask;
 import com.downloader.model.ProgressCallback;
 import com.downloader.detector.ProtocolDetector;
 import com.downloader.protocol.DownloadProtocol;
+import com.downloader.util.AppLogger;
+import com.downloader.util.RateLimiter;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -58,6 +60,32 @@ public class DownloadManager implements ConfigChangeListener {
     // 从配置中获取失败自动重试次数
     private int getMaxRetryCount() {
         return configManager.getInt("download.maxRetryCount", 3);
+    }
+
+    /**
+     * 计算任务生效的限速值（字节/秒）：
+     * 单任务覆盖优先（&gt;0 专属限速，-1 不限速），否则跟随全局配置（0=不限速）。
+     */
+    public long resolveSpeedLimitBps(DownloadTask task) {
+        long override = task.getSpeedLimitBps();
+        if (override < 0) {
+            return 0;
+        }
+        if (override > 0) {
+            return override;
+        }
+        long globalKB = configManager.getLong("download.globalSpeedLimitKB", 0);
+        return globalKB > 0 ? globalKB * 1024 : 0;
+    }
+
+    /** 全局限速配置变化后刷新所有任务的限速器（单任务覆盖不受影响） */
+    private void refreshAllSpeedLimits() {
+        for (DownloadTask t : taskMap.values()) {
+            RateLimiter rl = t.getRateLimiter();
+            if (rl != null) {
+                rl.setLimitBytesPerSec(resolveSpeedLimitBps(t));
+            }
+        }
     }
 
     private DownloadManager() {
@@ -166,7 +194,10 @@ public class DownloadManager implements ConfigChangeListener {
                 if (task == null) {
                     continue;
                 }
-                taskMap.put(task.getId(), task);
+                // 历史文件中可能出现重复 id：跳过重复项，避免任务列表重复显示
+                if (taskMap.putIfAbsent(task.getId(), task) != null) {
+                    continue;
+                }
                 taskIdOrder.add(task.getId());
                 maxId = Math.max(maxId, parseTaskIdSuffix(task.getId()));
                 count++;
@@ -176,10 +207,10 @@ public class DownloadManager implements ConfigChangeListener {
             }
             restoredTaskCount = count;
             if (count > 0) {
-                System.out.println("已恢复 " + count + " 条历史下载记录");
+                AppLogger.info("已恢复 " + count + " 条历史下载记录");
             }
         } catch (Exception e) {
-            System.err.println("恢复历史下载记录失败: " + e.getMessage());
+            AppLogger.warn("恢复历史下载记录失败: " + e.getMessage());
         }
     }
 
@@ -202,23 +233,42 @@ public class DownloadManager implements ConfigChangeListener {
 
     private void executeTask(DownloadTask task) {
         runningTasks.add(task);
-        task.setStatus(DownloadTask.TaskStatus.DOWNLOADING);
+        task.transitionTo(DownloadTask.TaskStatus.DOWNLOADING);
         task.setStartTime(LocalDateTime.now());
-        
+        // 本轮执行代数：暂停/取消/删除会使旧代数失效，旧线程的回调被整体忽略
+        final long generation = task.nextRunGeneration();
+
+        // 任务级限速器：单任务覆盖优先，否则跟随全局配置（0=不限速）
+        RateLimiter limiter = new RateLimiter(resolveSpeedLimitBps(task));
+        task.setRateLimiter(limiter);
+
         // 创建进度回调
         ProgressCallback callback = new ProgressCallback() {
             @Override
             public void onConnected(String fileName, long totalSize) {
+                if (!task.isRunValid(generation)) {
+                    return;
+                }
                 task.setFileName(fileName);
                 task.setTotalSize(totalSize);
-                // 构建保存文件路径并保存
-                java.io.File saveFile = new java.io.File(task.getSavePath(), fileName);
+                // 实际保存路径由 onSaveFile 回调提供（下载器处理重名避让后才有真实值）
+                notifyTaskUpdated(task);
+            }
+
+            @Override
+            public void onSaveFile(java.io.File saveFile) {
+                if (!task.isRunValid(generation)) {
+                    return;
+                }
                 task.setSaveFilePath(saveFile.getAbsolutePath());
                 notifyTaskUpdated(task);
             }
 
             @Override
             public void onProgress(long dl, long total, long speed) {
+                if (!task.isRunValid(generation)) {
+                    return;
+                }
                 long current = task.getDownloadedSize();
                 if (dl < current) {
                     // 新一轮尝试的累计字节数小于任务已记录值（如分片下载整体重下），直接重置基数
@@ -237,11 +287,14 @@ public class DownloadManager implements ConfigChangeListener {
 
             @Override
             public void onComplete() {
+                if (!task.isRunValid(generation)) {
+                    return;
+                }
                 // 确保下载完成时进度显示100%
                 if (task.getTotalSize() > 0) {
                     task.setDownloadedSize(task.getTotalSize());
                 }
-                task.setStatus(DownloadTask.TaskStatus.COMPLETED);
+                task.transitionTo(DownloadTask.TaskStatus.COMPLETED);
                 task.setCompletedTime(LocalDateTime.now());
                 task.setSpeed(0);
                 runningTasks.remove(task);
@@ -254,12 +307,15 @@ public class DownloadManager implements ConfigChangeListener {
 
             @Override
             public void onError(String msg) {
+                if (!task.isRunValid(generation)) {
+                    return;
+                }
                 handleTaskFailure(task, msg);
             }
         };
-        
+
         task.setCallback(callback);
-        
+
         // 提交到线程池执行
         threadPool.submit(() -> {
             try {
@@ -271,13 +327,20 @@ public class DownloadManager implements ConfigChangeListener {
                         task.getPassword(),
                         callback,
                         task.getDownloadedSize(),
-                        task.getSaveFilePath()
+                        task.getSaveFilePath(),
+                        limiter
                 );
+                if (!task.isRunValid(generation)) {
+                    // 等待队列期间任务被暂停/取消/删除：立即关闭刚创建的下载器，不再启动
+                    downloader.close();
+                    return;
+                }
                 task.setDownloader(downloader);
                 downloader.download();
                 // 兜底：下载器正常返回但既未回调完成、也不是暂停/取消/失败，
                 // 说明有静默异常，标记失败走重试，避免任务永久卡在"下载中"
-                if (task.getStatus() == DownloadTask.TaskStatus.DOWNLOADING) {
+                if (task.getStatus() == DownloadTask.TaskStatus.DOWNLOADING
+                        && task.isRunValid(generation)) {
                     handleTaskFailure(task, "下载未正常完成（下载器提前返回）");
                 }
             } catch (InterruptedException e) {
@@ -291,14 +354,14 @@ public class DownloadManager implements ConfigChangeListener {
                 }
             } catch (Exception e) {
                 // 检查任务是否被取消、暂停或已完成
-                if (task.getStatus() != DownloadTask.TaskStatus.PAUSED && 
-                    task.getStatus() != DownloadTask.TaskStatus.FAILED && 
+                if (task.getStatus() != DownloadTask.TaskStatus.PAUSED &&
+                    task.getStatus() != DownloadTask.TaskStatus.FAILED &&
                     task.getStatus() != DownloadTask.TaskStatus.COMPLETED) {
                     handleTaskFailure(task, e.getMessage());
                 }
             }
         });
-        
+
         notifyTaskUpdated(task);
     }
     
@@ -306,6 +369,11 @@ public class DownloadManager implements ConfigChangeListener {
      * 处理任务失败，实现指数退避重试（重试次数上限由配置 download.maxRetryCount 决定）
      */
     private void handleTaskFailure(DownloadTask task, String errorMessage) {
+        // 任务已被删除（taskMap 中不存在或被替换）时不得复活：
+        // 旧下载线程迟到抛错、被删除任务的回调都不允许再安排重试
+        if (taskMap.get(task.getId()) != task) {
+            return;
+        }
         runningTasks.remove(task);
         task.close();
 
@@ -315,15 +383,17 @@ public class DownloadManager implements ConfigChangeListener {
             long backoffTime = (long) Math.pow(2, retryCount) * 1000;
 
             task.incrementRetryCount();
-            task.setStatus(DownloadTask.TaskStatus.WAITING);
+            task.transitionTo(DownloadTask.TaskStatus.WAITING);
             task.setErrorMessage(errorMessage + " (将在 " + (backoffTime / 1000) + "秒后重试，第 " + task.getRetryCount() + " 次)");
 
             // 延迟后重新加入队列（独立调度线程，不占用下载线程池）
             retryScheduler.schedule(() -> {
-                if (task.getStatus() == DownloadTask.TaskStatus.WAITING) {
+                // 退避等待期间任务可能已被删除/替换，入队前再校验一次
+                if (task.getStatus() == DownloadTask.TaskStatus.WAITING
+                        && taskMap.get(task.getId()) == task) {
                     if (!taskQueue.offer(task)) {
                         // 队列满（极端积压）：直接标记失败而不是静默丢弃
-                        task.setStatus(DownloadTask.TaskStatus.FAILED);
+                        task.transitionTo(DownloadTask.TaskStatus.FAILED);
                         task.setErrorMessage("任务队列已满，重试无法入队");
                         notifyTaskUpdated(task);
                         eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_FAILED, task, "任务队列已满"));
@@ -336,7 +406,7 @@ public class DownloadManager implements ConfigChangeListener {
             }, backoffTime, TimeUnit.MILLISECONDS);
         } else {
             // 达到最大重试次数，标记为失败
-            task.setStatus(DownloadTask.TaskStatus.FAILED);
+            task.transitionTo(DownloadTask.TaskStatus.FAILED);
             task.setErrorMessage(errorMessage + " (已达到最大重试次数)");
             notifyTaskUpdated(task);
             // 发布任务失败事件
@@ -370,9 +440,9 @@ public class DownloadManager implements ConfigChangeListener {
             task.resetRetryCount();
             task.setErrorMessage(null);
         }
-        task.setStatus(DownloadTask.TaskStatus.WAITING);
+        task.transitionTo(DownloadTask.TaskStatus.WAITING);
         if (!taskQueue.offer(task)) {
-            task.setStatus(DownloadTask.TaskStatus.FAILED);
+            task.transitionTo(DownloadTask.TaskStatus.FAILED);
             task.setErrorMessage("任务队列已满，无法开始任务");
             notifyTaskUpdated(task);
             return;
@@ -397,6 +467,10 @@ public class DownloadManager implements ConfigChangeListener {
         DownloadTask task = taskMap.remove(taskId);
         taskIdOrder.remove(taskId);
         if (task != null) {
+            // 先取消正在执行的下载器（旧线程回调随代数失效），
+            // 再清队列与资源；handleTaskFailure/重试调度会校验 taskMap，
+            // 已删除的任务不会复活或重新入队
+            task.cancel();
             runningTasks.remove(task);
             taskQueue.remove(task);
             task.close();
@@ -528,8 +602,11 @@ public class DownloadManager implements ConfigChangeListener {
                     executor.setMaximumPoolSize(newMaxThreads);
                 }
             } catch (IllegalArgumentException e) {
-                System.err.println("线程池配置更新失败: " + e.getMessage());
+                AppLogger.warn("线程池配置更新失败: " + e.getMessage());
             }
         }
+
+        // 全局限速（或与限速相关的配置）变化：即时刷新所有任务的限速器
+        refreshAllSpeedLimits();
     }
 }

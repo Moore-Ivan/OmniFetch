@@ -14,6 +14,21 @@ public final class FileUtils {
     private FileUtils() {}
 
     /**
+     * 清洗文件名：替换路径分隔符、消解 ".." 与控制字符。
+     * 文件名来自服务器响应头/URL/远端目录列表，属于不可信输入，
+     * 不清洗会被用于路径穿越写入（如 "..\\..\\evil.exe"、"..%2F"）
+     */
+    public static String sanitizeFileName(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String s = raw.replace('\\', '_').replace('/', '_')
+                .replace("..", "_");
+        s = s.replaceAll("[\\x00-\\x1f]", "_").trim();
+        return s;
+    }
+
+    /**
      * 构建保存文件路径，自动创建目录，自动处理重名
      */
     public static File buildSaveFile(String dir, String fileName) {
@@ -22,17 +37,22 @@ public final class FileUtils {
             d.mkdirs();
         }
 
-        File f = new File(d, fileName);
+        String safe = sanitizeFileName(fileName);
+        if (safe.isEmpty()) {
+            safe = "download_" + System.currentTimeMillis();
+        }
+
+        File f = new File(d, safe);
         if (!f.exists()) {
             return f;
         }
 
-        String base = fileName;
+        String base = safe;
         String ext = "";
-        int dot = fileName.lastIndexOf('.');
+        int dot = safe.lastIndexOf('.');
         if (dot > 0) {
-            base = fileName.substring(0, dot);
-            ext = fileName.substring(dot);
+            base = safe.substring(0, dot);
+            ext = safe.substring(dot);
         }
 
         int i = 1;
@@ -49,23 +69,25 @@ public final class FileUtils {
     public static String extractFileName(String contentDisposition, String url) {
         // 从 Content-Disposition 提取
         if (contentDisposition != null && contentDisposition.contains("filename=")) {
-            String name = contentDisposition
+            String name = sanitizeFileName(contentDisposition
                     .substring(contentDisposition.indexOf("filename=") + 9)
                     .replaceAll("[\"';]", "")
-                    .trim();
+                    .trim());
             if (!name.isEmpty()) {
                 return name;
             }
         }
 
-        // 从 URL 路径提取
+        // 从 URL 路径提取（先解码再清洗：编码形态 %2E%2E%2F 一样危险）
         try {
             URI uri = new URI(url);
             String path = uri.getPath();
             if (path != null) {
-                String name = path.substring(path.lastIndexOf('/') + 1);
+                String name = sanitizeFileName(URLDecoder.decode(
+                        path.substring(path.lastIndexOf('/') + 1),
+                        StandardCharsets.UTF_8));
                 if (!name.isEmpty() && name.contains(".")) {
-                    return URLDecoder.decode(name, StandardCharsets.UTF_8);
+                    return name;
                 }
             }
         } catch (Exception ignored) {}
@@ -81,6 +103,19 @@ public final class FileUtils {
             try {
                 c.close();
             } catch (IOException ignored) {}
+        }
+    }
+
+    /**
+     * 原子改名/移动：REPLACE_EXISTING + ATOMIC_MOVE，跨文件系统等不支持原子移动时
+     * 回退非原子 REPLACE_EXISTING。用于 .part → 最终文件的落盘收尾与续传元数据替换。
+     */
+    public static void atomicMove(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target,
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
