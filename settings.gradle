@@ -1,41 +1,55 @@
 pluginManagement {
+    // 变量必须在 pluginManagement 块内部声明，不能放在块外面
+    def isCI = System.getenv('CI') == 'true'
+
     repositories {
-        // 本地 Maven 默认不启用，避免拖慢构建和引入不完整模块。
-        // 如需使用本地 SNAPSHOT，请放到仓库列表最后，并建议加 content 过滤。
-        // mavenLocal()
+        mavenLocal()
 
-        // 国内镜像：Gradle 插件专用镜像优先
-        maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
-        maven { url = uri('https://maven.aliyun.com/repository/public') }
-        maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
-        maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        if (!isCI) {
+            // 本地环境：优先国内镜像加速
+            maven { url = uri('https://maven.aliyun.com/repository/gradle-plugin') }
+            maven { url = uri('https://maven.aliyun.com/repository/public') }
+            maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+            maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        }
 
-        // 官方兜底源
+        // CI 环境直接走官方源；本地环境作为兜底
         gradlePluginPortal()
         google()
         mavenCentral()
+
+        if (isCI) {
+            // CI 中保留腾讯云/华为云作为官方源之后的备选，跳过阿里云
+            maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+            maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        }
     }
 }
 
 dependencyResolutionManagement {
-    // 优先使用本文件统一配置的仓库；子项目若自行声明仓库，则子项目优先。
-    // 如需强制所有子项目只能使用本文件仓库，可改为 RepositoriesMode.FAIL_ON_PROJECT_REPOS。
+    // 同样必须在块内部声明
+    def isCI = System.getenv('CI') == 'true'
+
     repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
 
     repositories {
-        // 本地 Maven 默认不启用，避免拖慢依赖解析。
-        // 如需使用本地 SNAPSHOT，请放到仓库列表最后，并建议加 content 过滤。
-        // mavenLocal()
+        mavenLocal()
 
-        // 国内镜像
-        maven { url = uri('https://maven.aliyun.com/repository/public') }
-        maven { url = uri('https://maven.aliyun.com/repository/google') }
-        maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
-        maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        if (!isCI) {
+            maven { url = uri('https://maven.aliyun.com/repository/public') }
+            maven { url = uri('https://maven.aliyun.com/repository/google') }
+            maven { url = uri('https://maven.aliyun.com/repository/central') }
+            maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+            maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        }
 
-        // 官方兜底源
         google()
         mavenCentral()
+
+        if (isCI) {
+            maven { url = uri('https://mirrors.cloud.tencent.com/nexus/repository/maven-public/') }
+            maven { url = uri('https://repo.huaweicloud.com/repository/maven/') }
+        }
     }
 }
 
