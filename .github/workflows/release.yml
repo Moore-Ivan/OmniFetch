@@ -47,8 +47,35 @@ jobs:
           chcp 65001
           dir build\jpackage
 
+      # 生成 Tauri 更新清单并随 Release 上传：
+      # 客户端通过固定地址 releases/latest/download/latest.json 检查更新，
+      # 该 URL 始终 302 到最新 Release 的同名资产，发版无需再手动维护清单
+      - name: Generate latest.json (Tauri updater manifest)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "build/jpackage/OmniFetch-*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "未找到安装包 build/jpackage/OmniFetch-*.exe" }
+          $tag = "${{ github.ref_name }}"
+          $manifest = [ordered]@{
+            version  = $exe.BaseName -replace '^OmniFetch-', ''
+            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            notes    = ''
+            platforms = [ordered]@{
+              'windows-x86_64' = [ordered]@{
+                signature = ''
+                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$($exe.Name)"
+              }
+            }
+          }
+          ConvertTo-Json -InputObject $manifest -Depth 5 |
+            Set-Content -Path build/latest.json -Encoding utf8NoBOM
+          Write-Host "------ build/latest.json ------"
+          Get-Content build/latest.json
+
       - name: Upload installer to Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: build/jpackage/OmniFetch-*.exe
+          files: |
+            build/jpackage/OmniFetch-*.exe
+            build/latest.json

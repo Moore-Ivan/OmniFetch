@@ -85,7 +85,7 @@ final class UpdateDialog extends JDialog {
         this.asset = pickWindowsAsset(result);
         File dir = UpdateDownloader.defaultDownloadDir();
         dir.mkdirs();
-        // 文件名来自 GitHub API 响应，清洗防止异常字符写入非法路径
+        // 文件名来自 latest.json 清单中的下载地址，清洗防止异常字符写入非法路径
         this.installerFile = asset != null
                 ? new File(dir, FileUtils.sanitizeFileName(asset.name)) : null;
 

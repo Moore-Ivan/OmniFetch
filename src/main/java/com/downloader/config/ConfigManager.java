@@ -96,6 +96,7 @@ public class ConfigManager {
         number("下载配置", "download.maxThreads", "最大线程数", "个", 1, 256, 1, 20);
         number("下载配置", "download.bufferSize", "缓冲区大小", "字节", 4096, 16_777_216, 4096, 262_144);
         number("下载配置", "download.connectTimeoutSec", "连接超时", "秒", 1, 300, 1, 15);
+        number("下载配置", "download.responseTimeoutSec", "响应超时", "秒", 5, 300, 1, 30);
         number("下载配置", "download.progressIntervalMs", "进度更新间隔", "毫秒", 50, 5_000, 50, 200);
         number("下载配置", "download.flushIntervalMs", "磁盘刷新间隔", "毫秒", 1_000, 120_000, 1_000, 10_000);
         number("下载配置", "download.maxRetryCount", "失败自动重试次数", "次", 0, 10, 1, 3);

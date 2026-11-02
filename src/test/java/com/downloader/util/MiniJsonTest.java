@@ -82,6 +82,7 @@ public class MiniJsonTest {
     // ── 嵌套结构 ──
 
     @Test
+    @SuppressWarnings("unchecked")
     public void nestedCollections() throws IOException {
         Map<String, Object> map = parseObject(
                 "{\"a\": [1, {\"b\": true}, null], \"c\": []}");

@@ -2,31 +2,50 @@ package com.downloader.util;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 /**
- * 应用更新检查器。
- * 通过 GitHub Releases API 查询最新版本，与本地版本比较，
- * 并解析发布资产（安装包下载地址、大小）与发布说明。
+ * 应用更新检查器（Tauri latest.json 方案）。
+ * 从固定静态地址拉取 latest.json（与 Tauri updater 相同的清单格式），
+ * 与本地版本比较，并解析当前平台的安装包下载地址与发布说明：
+ * <pre>
+ * {
+ *   "version": "1.2.0",
+ *   "pub_date": "2026-11-02T00:00:00Z",
+ *   "notes": "本次更新内容…",
+ *   "platforms": {
+ *     "windows-x86_64": {
+ *       "signature": "",
+ *       "url": "https://github.com/Moore-Ivan/OmniFetch/releases/download/v1.2.0/OmniFetch-1.2.0.exe"
+ *     }
+ *   }
+ * }
+ * </pre>
+ * 清单是静态文件，随 Release Assets 发布（由 release.yml 在发版时自动生成），
+ * 不依赖 GitHub API，无接口限流问题；同时兼容 Tauri v1 的平铺格式
+ * （根级 url/signature，无 platforms 映射）。
  */
 public final class UpdateChecker {
 
-    private static final String REPO_API =
-            "https://api.github.com/repos/Moore-Ivan/OmniFetch/releases/latest";
-    /** Releases 列表页 */
+    /** latest.json 唯一地址：最新 Release Assets 内的清单（固定 URL，自动 302 到最新版本，无限流）。
+     * 清单由 release.yml 在发版时按 tag 自动生成上传，无需手动维护 */
+    static final String LATEST_JSON_URL =
+            "https://github.com/Moore-Ivan/OmniFetch/releases/latest/download/latest.json";
+    /** Releases 列表页（「查看发布页」入口） */
     public static final String RELEASES_PAGE_URL =
             "https://github.com/Moore-Ivan/OmniFetch/releases";
     /** 具体版本页前缀（"查看发布页"直接进入对应 tag，形如 /releases/tag/v1.0.1） */
     private static final String RELEASE_PAGE_PREFIX = RELEASES_PAGE_URL + "/tag/";
-    /** 网页端 latest：302 跳转到最新 tag 页面，不受 GitHub API 每 IP 限流（403/429）影响 */
-    private static final String REPO_LATEST_PAGE = RELEASES_PAGE_URL + "/latest";
+
+    /** 本应用当前平台的 Tauri 清单平台键 */
+    private static final String PLATFORM_KEY = "windows-x86_64";
 
     /** HttpClient：信任所有证书（与下载器共用 HttpTrust），解决运行环境 cacerts 不完整问题 */
     private static final HttpClient HTTP_CLIENT;
@@ -62,7 +81,7 @@ public final class UpdateChecker {
         public final boolean hasUpdate;
         public final String latestVersion;   // 不带 v 前缀，如 "1.0.1"
         public final String errorMsg;        // 出错时有值
-        public final List<Asset> assets;     // 发布资产列表
+        public final List<Asset> assets;     // 安装包资产（latest.json 单地址，至多一项）
         public final String releaseNotes;    // 发布说明（Markdown 原文，可为空）
 
         private Result(boolean hasUpdate, String latestVersion, String errorMsg,
@@ -102,208 +121,111 @@ public final class UpdateChecker {
 
     /**
      * 同步检查更新（调用方应在线程中执行）。
-     * 先走 GitHub API（信息最全）；遇到 403/429（IP 限流、代理拦截，国内网络常见）
-     * 或网络层失败时，自动降级到网页端 releases/latest（不受 API 限流）。
+     * GET latest.json 静态清单 → 解析版本号与当前平台下载地址 → 语义化版本比较。
      *
      * @param currentVersion 当前版本号，如 "1.0.0"
      */
     public static Result check(String currentVersion) {
-        Result apiResult;
-        boolean apiBlocked;
         try {
-            apiResult = checkViaApi(currentVersion);
-            apiBlocked = apiResult.errorMsg != null && isRateLimitOrNetworkError(apiResult.errorMsg);
-        } catch (IOException | InterruptedException e) {
-            apiResult = Result.error(e.getMessage());
-            apiBlocked = true;
-        }
-
-        if (!apiBlocked) {
-            return apiResult;
-        }
-
-        // 降级：网页端重定向取最新版本，HTML 中解析资产链接
-        try {
-            Result fallback = checkViaLatestPage(currentVersion);
-            if (fallback != null) {
-                return fallback;
-            }
-        } catch (IOException | InterruptedException e) {
-            // 两条链路都失败，返回 API 的原始错误（通常是 HTTP 403）
-        }
-        return apiResult;
-    }
-
-    private static Result checkViaApi(String currentVersion) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(REPO_API))
-                .timeout(Duration.ofSeconds(15))
-                .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "OmniFetch-UpdateChecker")
-                .GET()
-                .build();
-
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() != 200) {
-            return Result.error("HTTP " + response.statusCode());
-        }
-
-        String body = response.body();
-
-        // 用内置最小 JSON 解析器解析（不引入第三方依赖，且比正则可靠：
-        // 正则无法处理嵌套对象与字符串内转义，可能误匹配 uploader.name 等字段）
-        Object root;
-        try {
-            root = MiniJson.parse(body);
+            return fetchAndParse(currentVersion, LATEST_JSON_URL);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Result.error("检查更新被中断");
         } catch (IOException e) {
-            return Result.error("无法解析版本信息");
-        }
-        if (!(root instanceof Map<?, ?> rootMap)) {
-            return Result.error("无法解析版本信息");
-        }
-
-        Object tagValue = rootMap.get("tag_name");
-        if (!(tagValue instanceof String tag) || tag.isBlank()) {
-            return Result.error("无法解析版本信息");
-        }
-
-        String notes = rootMap.get("body") instanceof String b ? b : null;
-        List<Asset> assets = new ArrayList<>();
-        if (rootMap.get("assets") instanceof List<?> assetList) {
-            for (Object item : assetList) {
-                if (!(item instanceof Map<?, ?> asset)) {
-                    continue;
-                }
-                String name = asset.get("name") instanceof String n ? n : null;
-                String url = asset.get("browser_download_url") instanceof String u ? u : null;
-                long size = asset.get("size") instanceof Number num ? num.longValue() : -1;
-                if (name != null && url != null) {
-                    assets.add(new Asset(name, url, size));
-                }
-            }
-        }
-
-        // tag 形如 "v1.0.0"，去掉前缀
-        String latest = tag.startsWith("v") ? tag.substring(1) : tag;
-
-        if (isNewerVersion(currentVersion, latest)) {
-            return Result.hasUpdate(latest, assets, notes);
-        } else {
-            return Result.noUpdate(latest);
+            String msg = e.getMessage();
+            return Result.error(msg != null ? msg : e.getClass().getSimpleName());
         }
     }
 
-    /**
-     * 网页端降级：GET releases/latest 会 302 到 /releases/tag/vX.Y.Z，
-     * 跟随重定向后的最终地址包含版本号，响应体是版本页 HTML，可解析出资产下载链接。
-     *
-     * @return 检查结果；无法确定版本（如页面不存在）时返回 null
-     */
-    static Result checkViaLatestPage(String currentVersion)
+    private static Result fetchAndParse(String currentVersion, String manifestUrl)
             throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(REPO_LATEST_PAGE))
-                .timeout(Duration.ofSeconds(20))
-                .header("Accept", "text/html")
+                .uri(URI.create(manifestUrl))
+                .timeout(Duration.ofSeconds(15))
+                .header("Accept", "application/json")
                 .header("User-Agent", "OmniFetch-UpdateChecker")
                 .GET()
                 .build();
 
         HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() != 200) {
-            return null;
+            return Result.error("HTTP " + response.statusCode()
+                    + "（无法获取 latest.json：" + manifestUrl + "）");
         }
 
-        String path = response.uri().getPath();
-        int tagIdx = path == null ? -1 : path.lastIndexOf("/tag/");
-        if (tagIdx < 0) {
-            return null;
+        // 用内置最小 JSON 解析器解析（项目不引入第三方依赖）
+        Object root;
+        try {
+            root = MiniJson.parse(response.body());
+        } catch (IOException e) {
+            return Result.error("latest.json 解析失败");
         }
-        String tag = path.substring(tagIdx + "/tag/".length());
-        if (tag.isEmpty()) {
-            return null;
+        if (!(root instanceof Map<?, ?> rootMap)) {
+            return Result.error("latest.json 格式不正确");
         }
-        String latest = tag.startsWith("v") ? tag.substring(1) : tag;
+
+        // 版本号：允许带 v 前缀（Tauri 清单两种写法都存在）
+        Object versionValue = rootMap.get("version");
+        if (!(versionValue instanceof String tag) || tag.isBlank()) {
+            return Result.error("latest.json 缺少 version 字段");
+        }
+        String latest = tag.startsWith("v") ? tag.substring(1) : tag.trim();
+
+        String notes = rootMap.get("notes") instanceof String b && !b.isBlank() ? b : null;
+
+        // 平台条目：优先精确匹配 windows-x86_64，其次任意 windows-* 键；
+        // 兼容 Tauri v1 平铺格式（根级 url，无 platforms）
+        String downloadUrl = null;
+        if (rootMap.get("platforms") instanceof Map<?, ?> platforms) {
+            downloadUrl = extractUrl(platforms.get(PLATFORM_KEY));
+            if (downloadUrl == null) {
+                for (Object key : platforms.keySet()) {
+                    if (key instanceof String k && k.startsWith("windows-")) {
+                        downloadUrl = extractUrl(platforms.get(k));
+                        if (downloadUrl != null) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (downloadUrl == null) {
+            downloadUrl = extractUrl(rootMap.get("url"));
+        }
+
         if (!isNewerVersion(currentVersion, latest)) {
             return Result.noUpdate(latest);
         }
 
-        // 资产列表在版本页中通过 expanded_assets 片段异步加载，需再取一次该片段；
-        // 片段缺失或抓取失败时退化为直接解析版本页 HTML
-        List<Asset> assets = List.of();
-        String expandedPath = extractExpandedAssetsPath(response.body());
-        if (expandedPath == null) {
-            expandedPath = "/Moore-Ivan/OmniFetch/releases/expanded_assets/" + tag;
+        // 清单只提供单个安装包地址，包装为单元素资产列表（大小未知，下载时由 Content-Length 得知）
+        List<Asset> assets = downloadUrl != null
+                ? List.of(new Asset(assetNameFromUrl(downloadUrl), downloadUrl, -1))
+                : List.<Asset>of();
+        return Result.hasUpdate(latest, assets, notes);
+    }
+
+    /** 平台条目形如 {"signature": "...", "url": "..."}，取其中合法的 url 字符串 */
+    private static String extractUrl(Object platformEntry) {
+        if (platformEntry instanceof Map<?, ?> entry && entry.get("url") instanceof String url) {
+            return url.isBlank() ? null : url;
         }
+        return null;
+    }
+
+    /** 从下载地址提取文件名（URL 解码），非法时回退默认安装包名 */
+    private static String assetNameFromUrl(String url) {
         try {
-            assets = extractAssetsFromHtml(fetchPage("https://github.com" + expandedPath));
-        } catch (IOException | InterruptedException ignore) {
-            // 片段不可达时直接解析主页面（部分老版本/镜像会内联资产链接）
-        }
-        if (assets.isEmpty()) {
-            assets = extractAssetsFromHtml(response.body());
-        }
-        // 降级链路无发布说明与资产大小（下载开始后由 Content-Length 得知总大小）
-        return Result.hasUpdate(latest, assets, null);
-    }
-
-    private static String fetchPage(String url) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(20))
-                .header("Accept", "text/html")
-                .header("User-Agent", "OmniFetch-UpdateChecker")
-                .GET()
-                .build();
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-        return response.statusCode() == 200 ? response.body() : "";
-    }
-
-    /** 从版本页 HTML 中找 expanded_assets 片段地址，找不到返回 null。 */
-    static String extractExpandedAssetsPath(String html) {
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("src=\"(/Moore-Ivan/OmniFetch/releases/expanded_assets/[^\"]+)\"")
-                .matcher(html);
-        return m.find() ? m.group(1) : null;
-    }
-
-    /** 403/429（限流、代理拦截）或网络异常信息值得走网页端降级；其余（如 404/解析失败）不走。 */
-    private static boolean isRateLimitOrNetworkError(String msg) {
-        if (msg == null) {
-            return false;
-        }
-        return msg.startsWith("HTTP 403") || msg.startsWith("HTTP 429")
-                || msg.startsWith("HTTP 5"); // 网关层临时故障同样值得重试降级
-    }
-
-    /**
-     * 从 release 版本页 HTML 中提取资产链接：
-     * 形如 href="/Moore-Ivan/OmniFetch/releases/download/v1.0.0/OmniFetch-1.0.0.exe"。
-     * 优先返回 .exe；大小无法从页面获知，记为 -1（下载连接建立后取 Content-Length）。
-     */
-    static List<Asset> extractAssetsFromHtml(String html) {
-        List<Asset> assets = new ArrayList<>();
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("href=\"(/Moore-Ivan/OmniFetch/releases/download/[^\"]+)\"")
-                .matcher(html);
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        while (m.find()) {
-            String path;
-            try {
-                path = java.net.URLDecoder.decode(m.group(1), java.nio.charset.StandardCharsets.UTF_8);
-            } catch (IllegalArgumentException e) {
-                path = m.group(1);
+            String path = URI.create(url).getPath();
+            if (path != null && path.lastIndexOf('/') >= 0) {
+                String name = path.substring(path.lastIndexOf('/') + 1);
+                if (!name.isBlank()) {
+                    return URLDecoder.decode(name, StandardCharsets.UTF_8);
+                }
             }
-            if (!seen.add(path)) {
-                continue;
-            }
-            String name = path.substring(path.lastIndexOf('/') + 1);
-            assets.add(new Asset(name, "https://github.com" + path, -1));
+        } catch (IllegalArgumentException ignore) {
+            // 非法 URL：走默认名回退
         }
-        // .exe 排前（选择器按顺序取第一个 .exe）
-        assets.sort((a, b) -> Boolean.compare(!a.name.toLowerCase(Locale.ROOT).endsWith(".exe"),
-                !b.name.toLowerCase(Locale.ROOT).endsWith(".exe")));
-        return assets;
+        return "OmniFetch-Setup.exe";
     }
 
     /**

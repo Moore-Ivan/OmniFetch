@@ -50,6 +50,16 @@ public class HttpDownloader implements DownloadProtocol {
     private int getConnectTimeoutSec() {
         return configManager.getInt("download.connectTimeoutSec", 15);
     }
+
+    /**
+     * 等待响应头的最长时限（秒）。connectTimeout 只覆盖建立连接：
+     * 服务器接受连接后不返回响应（防火墙静默丢包、加速工具假死）时，
+     * HttpClient 会无限期等待响应头，任务将永久卡在"下载中"，因此每个
+     * 请求都必须带上该超时，把"无声挂起"变成可重试的明确失败。
+     */
+    private int getResponseTimeoutSec() {
+        return configManager.getInt("download.responseTimeoutSec", 30);
+    }
     
     private int getProgressIntervalMs() {
         return configManager.getInt("download.progressIntervalMs", 200);
@@ -128,6 +138,7 @@ public class HttpDownloader implements DownloadProtocol {
                 .header("Accept", "*/*")
                 // 显式要求不压缩传输：压缩响应会让落盘内容与原始文件不一致
                 .header("Accept-Encoding", "identity")
+                .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                 .build();
 
@@ -170,6 +181,7 @@ public class HttpDownloader implements DownloadProtocol {
                             .header("Accept", "*/*")
                             .header("Accept-Encoding", "identity")
                             .header("Range", "bytes=0-0")
+                            .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                             .GET()
                             .build(),
                     HttpResponse.BodyHandlers.ofInputStream());
@@ -400,6 +412,7 @@ public class HttpDownloader implements DownloadProtocol {
                 .header("Accept", "*")
                 .header("Accept-Encoding", "identity")
                 .header("Range", "bytes=0-2097151") // 测试2MB，增加测试数据量
+                .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                 .GET()
                 .build();
 
@@ -411,13 +424,17 @@ public class HttpDownloader implements DownloadProtocol {
             return 0;
         }
 
-        try (InputStream in = response.body()) {
+        // 测速读取同样可能卡死（服务器接受连接后停发数据），
+        // 用与分片下载相同的看门狗解除阻塞，避免任务在测速阶段无声挂起
+        try (InputStream in = response.body();
+             StallWatchdog watchdog = new StallWatchdog(in)) {
             byte[] buffer = new byte[16384]; // 增大测试缓冲区
             int read;
             long endTime = startTime + testDuration;
 
             while (System.currentTimeMillis() < endTime && (read = in.read(buffer)) != -1) {
                 bytesRead += read;
+                watchdog.activity();
             }
         }
 
@@ -493,6 +510,7 @@ public class HttpDownloader implements DownloadProtocol {
                 .header("Accept", "*/*")
                 .header("Accept-Encoding", "identity")
                 .header("Range", "bytes=" + requestStart + "-" + end)
+                .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                 .GET()
                 .build();
 
@@ -633,7 +651,8 @@ public class HttpDownloader implements DownloadProtocol {
                 .uri(URI.create(fileURL))
                 .header("User-Agent", getUserAgent())
                 .header("Accept", "*/*")
-                .header("Accept-Encoding", "identity");
+                .header("Accept-Encoding", "identity")
+                .timeout(Duration.ofSeconds(getResponseTimeoutSec()));
         if (start > 0) {
             // 支持断点续传，发送Range请求
             builder.header("Range", "bytes=" + start + "-");
@@ -838,6 +857,7 @@ public class HttpDownloader implements DownloadProtocol {
         boolean handshake = false;
         boolean refused = false;
         boolean unknownHost = false;
+        boolean timedOut = false;
         for (Throwable t = e; t != null; t = t.getCause()) {
             if (t instanceof SSLHandshakeException) {
                 handshake = true;
@@ -845,6 +865,10 @@ public class HttpDownloader implements DownloadProtocol {
                 refused = true;
             } else if (t instanceof UnknownHostException) {
                 unknownHost = true;
+            } else if (t instanceof HttpTimeoutException) {
+                // HttpConnectTimeoutException（连接阶段）与请求级 HttpTimeoutException
+                //（等待响应头阶段）都归入超时提示
+                timedOut = true;
             }
         }
         String hint;
@@ -856,6 +880,9 @@ public class HttpDownloader implements DownloadProtocol {
                     + "系统代理是否开启、防火墙是否拦截";
         } else if (unknownHost) {
             hint = "域名解析失败；请检查网络连接与 hosts 配置";
+        } else if (timedOut) {
+            hint = "连接或响应超时；目标服务器可能被防火墙拦截或无响应，"
+                    + "若使用 GitHub 加速工具请检查其是否正常运行";
         } else {
             return e;
         }

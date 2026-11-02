@@ -56,7 +56,8 @@ public class DownloadTask {
         return m;
     }
 
-    private final String id;
+    /** 任务唯一 ID（task_N）。删除任务后由 DownloadManager 重排，始终按当前任务顺序连续编号 */
+    private String id;
     private final String url;
     private final String savePath;
     private final String username;
@@ -101,6 +102,11 @@ public class DownloadTask {
     // Getters and setters
     public String getId() {
         return id;
+    }
+
+    /** 仅由 DownloadManager 在删除任务后重编号使用，其他调用方不得修改 ID */
+    public void setId(String id) {
+        this.id = id;
     }
 
     public String getUrl() {

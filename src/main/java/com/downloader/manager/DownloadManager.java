@@ -205,6 +205,8 @@ public class DownloadManager implements ConfigChangeListener {
             if (maxId > 0) {
                 taskIdGenerator.set(maxId + 1);
             }
+            // 旧版本或异常退出可能留下带空洞的编号：启动时统一重排为连续的 task_1..task_N
+            renumberTasks();
             restoredTaskCount = count;
             if (count > 0) {
                 AppLogger.info("已恢复 " + count + " 条历史下载记录");
@@ -476,8 +478,40 @@ public class DownloadManager implements ConfigChangeListener {
             task.close();
             // 发布任务移除事件
             eventBus.publish(new DownloadEvent(DownloadEvent.EventType.TASK_REMOVED, task));
+            // 删除后重排其余任务 ID（task_N 连续表示当前顺序，json 同步重写）
+            renumberTasks();
             historyStore.markDirty();
         }
+    }
+
+    /**
+     * 任务删除后重编号：ID（task_N）始终按当前任务列表顺序连续编排，
+     * 历史记录持久化的也是重排后的 ID。编号未变化的任务不做任何改动，
+     * 变化的任务发布更新事件（新 ID 不在节流窗口内，界面必然收到刷新）。
+     */
+    private void renumberTasks() {
+        int next = 1;
+        for (int i = 0; i < taskIdOrder.size(); i++) {
+            String oldId = taskIdOrder.get(i);
+            DownloadTask task = taskMap.get(oldId);
+            if (task == null) {
+                continue;
+            }
+            String newId = "task_" + next++;
+            if (newId.equals(oldId)) {
+                continue;
+            }
+            // 先挂新键、改 ID，最后摘旧键：并发读取 taskMap 的线程
+            // 任意时刻都能通过新旧至少一个键拿到任务，不会出现短暂"查无此任务"
+            taskMap.put(newId, task);
+            task.setId(newId);
+            taskMap.remove(oldId);
+            // CopyOnWriteArrayList 按下标原子替换，getAllTasks 不会观察到中间空列表
+            taskIdOrder.set(i, newId);
+            notifyTaskUpdated(task);
+        }
+        // 新任务从当前任务数之后继续编号（重排后无空洞）
+        taskIdGenerator.set(next);
     }
 
     /** 按任务添加顺序返回（ConcurrentHashMap 自身顺序不确定） */
