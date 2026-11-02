@@ -47,19 +47,31 @@ jobs:
           chcp 65001
           dir build\jpackage
 
-      # 生成 Tauri 更新清单并随 Release 上传：
-      # 客户端通过固定地址 releases/latest/download/latest.json 检查更新，
-      # 该 URL 始终 302 到最新 Release 的同名资产，发版无需再手动维护清单
+      # 先创建 Release 并上传安装包（generate_release_notes 自动生成发布说明），
+      # 再把 Release 正文写入 Tauri 更新清单，随清单一起上传到 Assets：
+      # 客户端固定请求 releases/latest/download/latest.json 检查更新，
+      # 更新窗口展示的发布说明即来源于此，故必须先建 Release 再生成清单
+      - name: Upload installer to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: build/jpackage/OmniFetch-*.exe
+
       - name: Generate latest.json (Tauri updater manifest)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $exe = Get-ChildItem "build/jpackage/OmniFetch-*.exe" | Select-Object -First 1
           if (-not $exe) { throw "未找到安装包 build/jpackage/OmniFetch-*.exe" }
           $tag = "${{ github.ref_name }}"
+          # gh 输出按行拆成字符串数组，需重新拼接为多行文本
+          $notes = (gh release view $tag --json body --jq .body) -join "`n"
+          if (-not $notes) { Write-Warning "未能获取 Release 正文，发布说明将为空"; $notes = '' }
           $manifest = [ordered]@{
             version  = $exe.BaseName -replace '^OmniFetch-', ''
             pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-            notes    = ''
+            notes    = $notes
             platforms = [ordered]@{
               'windows-x86_64' = [ordered]@{
                 signature = ''
@@ -72,10 +84,7 @@ jobs:
           Write-Host "------ build/latest.json ------"
           Get-Content build/latest.json
 
-      - name: Upload installer to Release
+      - name: Upload latest.json to Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          files: |
-            build/jpackage/OmniFetch-*.exe
-            build/latest.json
+          files: build/latest.json

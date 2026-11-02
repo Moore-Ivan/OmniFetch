@@ -113,9 +113,13 @@ final class UpdateDialog extends JDialog {
     }
 
     private void initUI(String currentVersionDisplay) {
+        // 内容面板（BoxLayout 垂直堆叠）外面再套一层 BorderLayout 外壳：
+        // 直接用 BoxLayout 承载全部内容时，窗口富余高度会被分给可伸缩的面板，
+        // 无发布说明时标题区被大幅撑高（图标漂移到中部、出现大片空白）。
+        // 外壳让内容以自然高度贴顶（NORTH）、按钮区固定底部（SOUTH），中间留白
         JPanel root = new JPanel();
         root.setLayout(new BoxLayout(root, BoxLayout.Y_AXIS));
-        root.setBorder(new EmptyBorder(18, 20, 16, 20));
+        root.setBorder(new EmptyBorder(18, 20, 0, 20));
 
         // ── 标题区 ──
         JPanel header = new JPanel(new BorderLayout(12, 0));
@@ -232,14 +236,18 @@ final class UpdateDialog extends JDialog {
         progressPanel.add(Box.createVerticalStrut(5));
         progressPanel.add(statusLabel);
         root.add(progressPanel);
-        root.add(Box.createVerticalStrut(14));
 
-        // ── 按钮区（按状态动态重建） ──
+        // ── 按钮区（按状态动态重建），固定在窗口底部 ──
         buttonBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
-        buttonBar.setAlignmentX(Component.LEFT_ALIGNMENT);
-        root.add(buttonBar);
 
-        setContentPane(root);
+        JPanel shell = new JPanel(new BorderLayout());
+        shell.add(root, BorderLayout.NORTH);
+        JPanel south = new JPanel(new BorderLayout());
+        south.setBorder(new EmptyBorder(12, 20, 16, 20));
+        south.add(buttonBar, BorderLayout.EAST);
+        shell.add(south, BorderLayout.SOUTH);
+
+        setContentPane(shell);
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
             @Override
@@ -261,8 +269,8 @@ final class UpdateDialog extends JDialog {
             setState(State.READY);
         }
 
-        setSize(620, 380);
-        setMinimumSize(new Dimension(480, 380));
+        setSize(620, 430);
+        setMinimumSize(new Dimension(480, 400));
         setLocationRelativeTo(getOwner());
     }
 
