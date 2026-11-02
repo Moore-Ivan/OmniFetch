@@ -269,7 +269,9 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             toFront();
 
             String display = url.length() > 120 ? url.substring(0, 117) + "..." : url;
-            int choice = JOptionPane.showConfirmDialog(this,
+            // parent 传 null：与退出确认同理，owner 归属在主窗口最小化/恢复动画期间
+            // 会产生只有标题栏的空壳模态框，无 owner 的独立对话框不受其影响
+            int choice = JOptionPane.showConfirmDialog(null,
                     "在剪贴板中发现下载链接：\n" + display + "\n\n是否立即开始下载？",
                     "发现下载链接", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
             if (choice == JOptionPane.OK_OPTION) {
@@ -1392,7 +1394,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         }
         int result;
         try {
-            result = JOptionPane.showConfirmDialog(this,
+            // parent 传 null（无 owner 的独立模态对话框）：以最小化/恢复动画中的
+            // 主窗口为 owner 时，Windows 上对话框会渲染成只有标题栏的空壳且无法
+            // 交互（先恢复窗口再弹窗的时序修复已复现失效），无 owner 彻底规避
+            result = JOptionPane.showConfirmDialog(null,
                     message,
                     "确认退出",
                     JOptionPane.OK_CANCEL_OPTION);

@@ -147,32 +147,21 @@ final class UpdateDialog extends JDialog {
         titleBox.add(title);
         titleBox.add(Box.createVerticalStrut(3));
         titleBox.add(subtitleLabel);
-        // 保存位置单独一行，超长路径自动换行保证完整可见
-        JTextArea pathArea = new JTextArea(
-                "安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath()) {
+        // 保存位置单独一行；路径过长时按像素宽度手动断行。
+        // 不用 JTextArea 自动换行：其首选高度依赖布局时序与实际容器宽度，
+        // 组件未显示时预计算结果不可靠（曾导致只有第一行可见、其余被裁剪）
+        String pathLine = "安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath();
+        JLabel pathLabel = new JLabel(wrapToHtml(pathLine, 500)) {
             @Override
             public void updateUI() {
                 super.updateUI();
                 setForeground(UIManager.getColor("Label.disabledForeground"));
             }
         };
-        pathArea.setEditable(false);
-        pathArea.setFocusable(false);
-        pathArea.setLineWrap(true);
-        pathArea.setWrapStyleWord(true);
-        pathArea.setOpaque(false);
-        pathArea.setFont(baseFont);
-        pathArea.setForeground(UIManager.getColor("Label.disabledForeground"));
-        pathArea.setCaretPosition(0);
-        // 预计算换行后的首选高度：先按目标宽度 layout 再取首选高度，
-        // 避免超长路径把窗口撑宽（渲染时随容器实际宽度自动换行）
-        int wrapWidth = 534; // 620 窗口内宽 − 边距 40 − 图标 34 − 间距 12
-        pathArea.setSize(wrapWidth, Integer.MAX_VALUE);
-        pathArea.setPreferredSize(new Dimension(wrapWidth, pathArea.getPreferredSize().height));
-        pathArea.setMaximumSize(new Dimension(Integer.MAX_VALUE, pathArea.getPreferredSize().height));
-        pathArea.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pathLabel.setForeground(UIManager.getColor("Label.disabledForeground"));
+        pathLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         titleBox.add(Box.createVerticalStrut(3));
-        titleBox.add(pathArea);
+        titleBox.add(pathLabel);
         header.add(titleBox, BorderLayout.CENTER);
         root.add(header);
         root.add(Box.createVerticalStrut(12));
@@ -838,5 +827,49 @@ final class UpdateDialog extends JDialog {
             }
         }
         dispose();
+    }
+
+    /**
+     * 将单行说明文本按像素宽度手动断行并包装为 HTML。
+     * 手动断行而非依赖组件自动换行：JTextArea 自动换行的首选高度依赖
+     * 布局时序与容器实际宽度，组件未显示时计算结果不可靠；而 HTML JLabel
+     * 的多行首选高度由渲染引擎直接得出，始终正确。
+     */
+    private static String wrapToHtml(String text, int maxWidth) {
+        Font labelFont = UIManager.getFont("Label.font");
+        if (labelFont == null) {
+            return "<html>" + escapeHtml(text) + "</html>";
+        }
+        FontMetrics fm = new JLabel().getFontMetrics(labelFont);
+        if (fm.stringWidth(text) <= maxWidth) {
+            return "<html>" + escapeHtml(text) + "</html>";
+        }
+        StringBuilder html = new StringBuilder("<html>");
+        int lineStart = 0;
+        while (lineStart < text.length()) {
+            int acc = 0;
+            int fit = lineStart;
+            for (int i = lineStart; i < text.length(); i++) {
+                int w = fm.charWidth(text.charAt(i));
+                if (acc + w > maxWidth && i > lineStart) {
+                    break;
+                }
+                acc += w;
+                fit = i + 1;
+            }
+            if (fit == lineStart) {
+                fit = lineStart + 1;
+            }
+            html.append(escapeHtml(text.substring(lineStart, fit)));
+            if (fit < text.length()) {
+                html.append("<br>");
+            }
+            lineStart = fit;
+        }
+        return html.append("</html>").toString();
+    }
+
+    private static String escapeHtml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 }
