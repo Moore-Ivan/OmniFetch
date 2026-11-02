@@ -75,6 +75,8 @@ jobs:
             platforms = [ordered]@{
               'windows-x86_64' = [ordered]@{
                 signature = ''
+                # 非标准 Tauri 字段：客户端用于在下载前显示安装包总大小
+                size = $exe.Length
                 url = "https://github.com/${{ github.repository }}/releases/download/$tag/$($exe.Name)"
               }
             }

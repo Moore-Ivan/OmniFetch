@@ -174,40 +174,50 @@ public final class UpdateChecker {
         String notes = rootMap.get("notes") instanceof String b && !b.isBlank() ? b : null;
 
         // 平台条目：优先精确匹配 windows-x86_64，其次任意 windows-* 键；
-        // 兼容 Tauri v1 平铺格式（根级 url，无 platforms）
-        String downloadUrl = null;
+        // 兼容 Tauri v1 平铺格式（根级 url，无 platforms）。
+        // size 为非标准 Tauri 字段，由 release.yml 生成清单时写入，
+        // 用于更新窗口在下载前即显示安装包总大小（缺失时为 -1，连接后由 Content-Length 得知）
+        Map<?, ?> platformEntry = null;
         if (rootMap.get("platforms") instanceof Map<?, ?> platforms) {
-            downloadUrl = extractUrl(platforms.get(PLATFORM_KEY));
-            if (downloadUrl == null) {
+            platformEntry = validPlatformEntry(platforms.get(PLATFORM_KEY));
+            if (platformEntry == null) {
                 for (Object key : platforms.keySet()) {
                     if (key instanceof String k && k.startsWith("windows-")) {
-                        downloadUrl = extractUrl(platforms.get(k));
-                        if (downloadUrl != null) {
+                        platformEntry = validPlatformEntry(platforms.get(k));
+                        if (platformEntry != null) {
                             break;
                         }
                     }
                 }
             }
         }
-        if (downloadUrl == null) {
-            downloadUrl = extractUrl(rootMap.get("url"));
+        String downloadUrl;
+        long assetSize = -1;
+        if (platformEntry != null) {
+            downloadUrl = (String) platformEntry.get("url");
+            if (platformEntry.get("size") instanceof Number num) {
+                assetSize = num.longValue();
+            }
+        } else {
+            downloadUrl = rootMap.get("url") instanceof String u && !u.isBlank() ? u : null;
         }
 
         if (!isNewerVersion(currentVersion, latest)) {
             return Result.noUpdate(latest);
         }
 
-        // 清单只提供单个安装包地址，包装为单元素资产列表（大小未知，下载时由 Content-Length 得知）
+        // 清单只提供单个安装包地址，包装为单元素资产列表
         List<Asset> assets = downloadUrl != null
-                ? List.of(new Asset(assetNameFromUrl(downloadUrl), downloadUrl, -1))
+                ? List.of(new Asset(assetNameFromUrl(downloadUrl), downloadUrl, assetSize))
                 : List.<Asset>of();
         return Result.hasUpdate(latest, assets, notes);
     }
 
-    /** 平台条目形如 {"signature": "...", "url": "..."}，取其中合法的 url 字符串 */
-    private static String extractUrl(Object platformEntry) {
-        if (platformEntry instanceof Map<?, ?> entry && entry.get("url") instanceof String url) {
-            return url.isBlank() ? null : url;
+    /** 平台条目形如 {"signature": "...", "url": "...", "size": 123}，url 合法时原样返回 */
+    private static Map<?, ?> validPlatformEntry(Object platformEntry) {
+        if (platformEntry instanceof Map<?, ?> entry
+                && entry.get("url") instanceof String url && !url.isBlank()) {
+            return entry;
         }
         return null;
     }

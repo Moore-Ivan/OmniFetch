@@ -68,7 +68,6 @@ final class UpdateDialog extends JDialog {
 
     // 主题换肤支持：updateComponentTreeUI 不会重建自绘 LineBorder / 显式前景色，
     // 需要在组件 updateUI 时按新主题色重建
-    private JScrollPane notesScroll;
     private JPanel progressPanel;
     private JLabel subtitleLabel;
     private String lastStatusText = " ";
@@ -136,8 +135,7 @@ final class UpdateDialog extends JDialog {
                 : new Font(Font.SANS_SERIF, Font.BOLD, 16));
         title.setAlignmentX(Component.LEFT_ALIGNMENT);
         // updateUI 时按新主题重建前景色（显式 setForeground 不会被换肤覆盖）
-        subtitleLabel = new JLabel("当前版本 " + currentVersionDisplay
-                + "    安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath()) {
+        subtitleLabel = new JLabel("当前版本 " + currentVersionDisplay) {
             @Override
             public void updateUI() {
                 super.updateUI();
@@ -149,40 +147,37 @@ final class UpdateDialog extends JDialog {
         titleBox.add(title);
         titleBox.add(Box.createVerticalStrut(3));
         titleBox.add(subtitleLabel);
+        // 保存位置单独一行，超长路径自动换行保证完整可见
+        JTextArea pathArea = new JTextArea(
+                "安装包将保存到：" + UpdateDownloader.defaultDownloadDir().getAbsolutePath()) {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                setForeground(UIManager.getColor("Label.disabledForeground"));
+            }
+        };
+        pathArea.setEditable(false);
+        pathArea.setFocusable(false);
+        pathArea.setLineWrap(true);
+        pathArea.setWrapStyleWord(true);
+        pathArea.setOpaque(false);
+        pathArea.setFont(baseFont);
+        pathArea.setForeground(UIManager.getColor("Label.disabledForeground"));
+        pathArea.setCaretPosition(0);
+        // 预计算换行后的首选高度：先按目标宽度 layout 再取首选高度，
+        // 避免超长路径把窗口撑宽（渲染时随容器实际宽度自动换行）
+        int wrapWidth = 534; // 620 窗口内宽 − 边距 40 − 图标 34 − 间距 12
+        pathArea.setSize(wrapWidth, Integer.MAX_VALUE);
+        pathArea.setPreferredSize(new Dimension(wrapWidth, pathArea.getPreferredSize().height));
+        pathArea.setMaximumSize(new Dimension(Integer.MAX_VALUE, pathArea.getPreferredSize().height));
+        pathArea.setAlignmentX(Component.LEFT_ALIGNMENT);
+        titleBox.add(Box.createVerticalStrut(3));
+        titleBox.add(pathArea);
         header.add(titleBox, BorderLayout.CENTER);
         root.add(header);
         root.add(Box.createVerticalStrut(12));
 
-        // ── 发布说明 ──
-        String notes = result.releaseNotes;
-        if (notes != null && !notes.isBlank()) {
-            JTextArea notesArea = new JTextArea(notes.trim());
-            notesArea.setEditable(false);
-            notesArea.setLineWrap(true);
-            notesArea.setWrapStyleWord(true);
-            notesArea.setFont(baseFont);
-            notesArea.setBackground(UIManager.getColor("Panel.background"));
-            notesArea.setCaretPosition(0);
-            notesScroll = new JScrollPane(notesArea) {
-                @Override
-                public void updateUI() {
-                    super.updateUI();
-                    // 显式设置的 LineBorder 非 UIResource，换肤时不会被重置，
-                    // 必须在 updateUI 里按新主题色重建
-                    setBorder(BorderFactory.createCompoundBorder(
-                            new LineBorder(UIManager.getColor("Component.borderColor"), 1, true),
-                            new EmptyBorder(8, 10, 8, 10)));
-                }
-            };
-            notesScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
-            notesScroll.setBorder(BorderFactory.createCompoundBorder(
-                    new LineBorder(UIManager.getColor("Component.borderColor"), 1, true),
-                    new EmptyBorder(8, 10, 8, 10)));
-            notesScroll.setPreferredSize(new Dimension(560, 132));
-            notesScroll.getVerticalScrollBar().setUnitIncrement(12);
-            root.add(notesScroll);
-            root.add(Box.createVerticalStrut(12));
-        }
+        // 更新日志不再展示，如需查看完整发布说明可点「查看发布页」
 
         // ── 下载进度区 ──
         progressPanel = new JPanel() {
@@ -269,8 +264,8 @@ final class UpdateDialog extends JDialog {
             setState(State.READY);
         }
 
-        setSize(620, 430);
-        setMinimumSize(new Dimension(480, 400));
+        setSize(620, 300);
+        setMinimumSize(new Dimension(480, 280));
         setLocationRelativeTo(getOwner());
     }
 
