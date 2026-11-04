@@ -388,11 +388,11 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     }
 
     /**
-     * 从 classpath 加载应用图标。
+     * 从 classpath 加载应用图标（/icon/OmniFetch.ico，与 jpackage 打包的 exe 图标同源）。
      * ICO 文件内嵌 PNG 图像，JDK 无法直接解码 ICO，故解析 ICONDIR 头取出 PNG 数据再解码。
      */
     static Image loadAppIcon() {
-        try (InputStream in = MainWindow.class.getResourceAsStream("/万象抓取.ico")) {
+        try (InputStream in = MainWindow.class.getResourceAsStream("/icon/OmniFetch.ico")) {
             if (in == null) {
                 return null;
             }

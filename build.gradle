@@ -309,7 +309,7 @@ tasks.register('myJpackage', Exec) {
     if (isWindows) {
         argsList.addAll([
                 '--type', 'exe',
-                '--icon', "${projectDir}/src/main/resources/${displayName}.ico",
+                '--icon', "${projectDir}/src/main/resources/icon/${appName}.ico",
                 '--win-shortcut',
                 '--win-shortcut-prompt',
                 '--win-dir-chooser',
