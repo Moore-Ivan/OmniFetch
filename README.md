@@ -2,7 +2,7 @@
 
 ## 项目介绍
 
-OmniFetch 是一个功能强大的多协议下载管理器，支持 HTTP、HTTPS、FTP、SFTP、BitTorrent 和 M3U8 等多种协议，提供直观的图形界面和丰富的下载管理功能。
+OmniFetch 是一个功能强大的多协议下载管理器，支持 HTTP、HTTPS、FTP、SFTP、BitTorrent 和 M3U8 等多种协议，提供直观的图形界面和丰富的下载管理功能！
 
 ## 主要功能特性
 
@@ -54,7 +54,7 @@ OmniFetch 是一个功能强大的多协议下载管理器，支持 HTTP、HTTPS
 
 ### 构建工具
 
-- Gradle 9.8.0
+- Gradle 9.8.2
 
 ### 依赖库
 

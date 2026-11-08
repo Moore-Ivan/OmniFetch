@@ -244,6 +244,13 @@ public final class GitHubAccelerator {
         return null;
     }
 
+    /** 丢弃某地址的线路缓存：下载中途线路失效时，下一次选择必须重新探测 */
+    public static void invalidate(String originalUrl) {
+        if (originalUrl != null) {
+            ROUTE_CACHE.remove(originalUrl);
+        }
+    }
+
     /** 线路缓存项 */
     private static final class CachedRoute {
         final Route route;
@@ -273,9 +280,16 @@ public final class GitHubAccelerator {
         return bases;
     }
 
-    private static List<Candidate> buildCandidates(String originalUrl) {
-        List<Candidate> candidates = new ArrayList<>();
-        candidates.add(new Candidate("直连", originalUrl, false));
+    /**
+     * 该 GitHub 地址在全部镜像下的入口地址（不含直连）。
+     * 更新检查用它把固定的 latest.json 地址改写到可访问的加速入口：
+     * GitHub 不可达时，清单请求也能走镜像。
+     */
+    public static List<String> mirrorUrls(String originalUrl) {
+        List<String> urls = new ArrayList<>();
+        if (originalUrl == null) {
+            return urls;
+        }
         for (String base : mirrorBases()) {
             String normalized = base.trim();
             if (normalized.isEmpty()) {
@@ -290,12 +304,19 @@ public final class GitHubAccelerator {
                 }
                 url = normalized + originalUrl;
             }
-            String name = hostOf(normalized);
-            // 同一镜像重复配置或与已有候选相同时跳过
-            if (candidates.stream().anyMatch(c -> c.url.equals(url))) {
-                continue;
+            // 同一镜像重复配置或与已有入口相同时跳过
+            if (!urls.contains(url)) {
+                urls.add(url);
             }
-            candidates.add(new Candidate(name, url, true));
+        }
+        return urls;
+    }
+
+    private static List<Candidate> buildCandidates(String originalUrl) {
+        List<Candidate> candidates = new ArrayList<>();
+        candidates.add(new Candidate("直连", originalUrl, false));
+        for (String url : mirrorUrls(originalUrl)) {
+            candidates.add(new Candidate(hostOf(url), url, true));
         }
         return candidates;
     }

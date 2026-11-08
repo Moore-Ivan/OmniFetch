@@ -8,8 +8,16 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 应用更新检查器（Tauri latest.json 方案）。
@@ -47,20 +55,42 @@ public final class UpdateChecker {
     /** 本应用当前平台的 Tauri 清单平台键 */
     private static final String PLATFORM_KEY = "windows-x86_64";
 
-    /** HttpClient：信任所有证书（与下载器共用 HttpTrust），解决运行环境 cacerts 不完整问题 */
-    private static final HttpClient HTTP_CLIENT;
+    /** 直连清单请求超时：GitHub 被墙时尽快失败，把时间留给加速线路 */
+    private static final Duration DIRECT_TIMEOUT = Duration.ofSeconds(6);
+    /** 单条加速线路请求超时 */
+    private static final Duration MIRROR_TIMEOUT = Duration.ofSeconds(8);
+    /** 多条加速线路并发探测的总时限 */
+    private static final long MIRROR_BATCH_TIMEOUT_MS = 12_000L;
 
-    static {
+    /**
+     * 上一次成功取到清单的来源（直连或某个镜像入口）。
+     * 后续检查优先复用，命中时只需一次请求；失败则回落到完整探测流程。
+     */
+    private static volatile String preferredSource;
+
+    private UpdateChecker() {
+    }
+
+    /**
+     * 每次检查按当前代理配置重建客户端：
+     * 与下载器一致地继承手动/环境变量/系统代理，解决"浏览器能开 GitHub、本程序不能"的情况。
+     * 同时信任所有证书（与 HttpTrust 共用），解决运行环境 cacerts 不完整问题。
+     */
+    private static HttpClient buildHttpClient() {
         HttpClient.Builder builder = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .followRedirects(HttpClient.Redirect.NORMAL);
         if (HttpTrust.SSL_CONTEXT != null) {
             builder.sslContext(HttpTrust.SSL_CONTEXT);
         }
-        HTTP_CLIENT = builder.build();
-    }
-
-    private UpdateChecker() {
+        NetworkProxy.Config proxy = NetworkProxy.initial();
+        if (proxy != null) {
+            builder.proxy(proxy.selector);
+            if (proxy.authenticator != null) {
+                builder.authenticator(proxy.authenticator);
+            }
+        }
+        return builder.build();
     }
 
     /** 发布资产（可下载的安装包） */
@@ -121,36 +151,134 @@ public final class UpdateChecker {
 
     /**
      * 同步检查更新（调用方应在线程中执行）。
-     * GET latest.json 静态清单 → 解析版本号与当前平台下载地址 → 语义化版本比较。
+     * 依次尝试 GitHub 直连与各加速镜像获取 latest.json：任意一条可用即完成检查，
+     * 因此本地无法访问 GitHub 时仍能正常发现更新。
      *
      * @param currentVersion 当前版本号，如 "1.0.0"
      */
     public static Result check(String currentVersion) {
         try {
-            return fetchAndParse(currentVersion, LATEST_JSON_URL);
+            return checkFromSources(currentVersion);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Result.error("检查更新被中断");
-        } catch (IOException e) {
-            String msg = e.getMessage();
-            return Result.error(msg != null ? msg : e.getClass().getSimpleName());
         }
     }
 
-    private static Result fetchAndParse(String currentVersion, String manifestUrl)
+    private static Result checkFromSources(String currentVersion) throws InterruptedException {
+        List<String> mirrors = mirrorSources();
+        StringBuilder failures = new StringBuilder();
+        HttpClient client = buildHttpClient();
+        Map<?, ?> manifest = null;
+        String source = null;
+
+        // 1) 上次成功的来源优先：多数情况下只需一次请求（上次走镜像时直连大概率仍不通）
+        String preferred = preferredSource;
+        if (preferred != null && mirrors.contains(preferred)) {
+            try {
+                manifest = fetchManifest(client, preferred, DIRECT_TIMEOUT);
+                source = preferred;
+            } catch (IOException e) {
+                appendFailure(failures, preferred, e);
+            }
+        }
+
+        // 2) GitHub 直连：网络可达时是最短路径
+        if (manifest == null) {
+            try {
+                manifest = fetchManifest(client, LATEST_JSON_URL, DIRECT_TIMEOUT);
+                source = LATEST_JSON_URL;
+            } catch (IOException e) {
+                appendFailure(failures, LATEST_JSON_URL, e);
+            }
+        }
+
+        // 3) 直连失败：并发尝试全部镜像，取最先返回的合法清单
+        if (manifest == null && !mirrors.isEmpty()) {
+            FetchedManifest fetched = fetchFirstMirror(client, mirrors, failures);
+            if (fetched != null) {
+                manifest = fetched.json;
+                source = fetched.source;
+            }
+        }
+
+        if (manifest == null) {
+            String detail = failures.length() == 0 ? "" : "（" + failures + "）";
+            if (mirrors.isEmpty()) {
+                return Result.error("无法获取更新清单" + detail
+                        + "；可在设置中开启「GitHub 加速」后重试");
+            }
+            return Result.error("无法获取更新清单，GitHub 直连与加速线路均不可用" + detail);
+        }
+
+        preferredSource = source;
+        AppLogger.info("更新清单来源: " + source);
+        return buildResult(currentVersion, manifest);
+    }
+
+    /** 候选镜像入口：GitHub 加速关闭时为空（仅走直连） */
+    private static List<String> mirrorSources() {
+        if (!GitHubAccelerator.enabled()) {
+            return List.of();
+        }
+        return new ArrayList<>(GitHubAccelerator.mirrorUrls(LATEST_JSON_URL));
+    }
+
+    /**
+     * 并发请求全部镜像，返回最先拿到的合法清单。
+     * 镜像互不相同，并发不会向同一主机施压；只要有一条线路可用即结束等待。
+     */
+    private static FetchedManifest fetchFirstMirror(HttpClient client, List<String> mirrors,
+                                                    StringBuilder failures) throws InterruptedException {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        List<String> mirrorErrors = Collections.synchronizedList(new ArrayList<>());
+        try {
+            List<Callable<FetchedManifest>> tasks = new ArrayList<>(mirrors.size());
+            for (String url : mirrors) {
+                tasks.add(() -> {
+                    try {
+                        return new FetchedManifest(url, fetchManifest(client, url, MIRROR_TIMEOUT));
+                    } catch (IOException e) {
+                        mirrorErrors.add(hostOf(url) + "=" + messageOf(e));
+                        throw e;
+                    }
+                });
+            }
+            return executor.invokeAny(tasks, MIRROR_BATCH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException | TimeoutException e) {
+            synchronized (mirrorErrors) {
+                for (String error : mirrorErrors) {
+                    if (failures.length() > 0) {
+                        failures.append('；');
+                    }
+                    failures.append(error);
+                }
+            }
+            return null;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * 拉取并校验清单：只有能解析出 version 的响应才算有效，
+     * 避免个别加速线路用 HTML 错误页冒充文件，导致误判为"已是最新"。
+     */
+    private static Map<?, ?> fetchManifest(HttpClient client, String manifestUrl, Duration timeout)
             throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(manifestUrl))
-                .timeout(Duration.ofSeconds(15))
+                .timeout(timeout)
                 .header("Accept", "application/json")
                 .header("User-Agent", "OmniFetch-UpdateChecker")
+                .header("Cache-Control", "no-cache")
                 .GET()
                 .build();
 
-        HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() != 200) {
-            return Result.error("HTTP " + response.statusCode()
-                    + "（无法获取 latest.json：" + manifestUrl + "）");
+            throw new IOException("HTTP " + response.statusCode());
         }
 
         // 用内置最小 JSON 解析器解析（项目不引入第三方依赖）
@@ -158,12 +286,42 @@ public final class UpdateChecker {
         try {
             root = MiniJson.parse(response.body());
         } catch (IOException e) {
-            return Result.error("latest.json 解析失败");
+            throw new IOException("清单不是合法 JSON（可能被加速线路替换成了错误页）", e);
         }
-        if (!(root instanceof Map<?, ?> rootMap)) {
-            return Result.error("latest.json 格式不正确");
+        if (!(root instanceof Map<?, ?> map)) {
+            throw new IOException("清单格式不正确");
         }
+        if (!(map.get("version") instanceof String tag) || tag.isBlank()) {
+            throw new IOException("清单缺少 version 字段");
+        }
+        return map;
+    }
 
+    private static void appendFailure(StringBuilder failures, String url, IOException e) {
+        if (failures.length() > 0) {
+            failures.append('；');
+        }
+        failures.append(url.equals(LATEST_JSON_URL) ? "直连" : hostOf(url))
+                .append('=')
+                .append(messageOf(e));
+    }
+
+    private static String messageOf(Exception e) {
+        String msg = e.getMessage();
+        return msg != null && !msg.isBlank() ? msg : e.getClass().getSimpleName();
+    }
+
+    private static String hostOf(String url) {
+        try {
+            String host = URI.create(url).getHost();
+            return host != null ? host : url;
+        } catch (IllegalArgumentException e) {
+            return url;
+        }
+    }
+
+    /** 清单内容 → 检查结果（版本比较与平台条目解析） */
+    private static Result buildResult(String currentVersion, Map<?, ?> rootMap) {
         // 版本号：允许带 v 前缀（Tauri 清单两种写法都存在）
         Object versionValue = rootMap.get("version");
         if (!(versionValue instanceof String tag) || tag.isBlank()) {
@@ -211,6 +369,17 @@ public final class UpdateChecker {
                 ? List.of(new Asset(assetNameFromUrl(downloadUrl), downloadUrl, assetSize))
                 : List.<Asset>of();
         return Result.hasUpdate(latest, assets, notes);
+    }
+
+    /** 命中的清单来源与其内容 */
+    private static final class FetchedManifest {
+        final String source;
+        final Map<?, ?> json;
+
+        FetchedManifest(String source, Map<?, ?> json) {
+            this.source = source;
+            this.json = json;
+        }
     }
 
     /** 平台条目形如 {"signature": "...", "url": "...", "size": 123}，url 合法时原样返回 */

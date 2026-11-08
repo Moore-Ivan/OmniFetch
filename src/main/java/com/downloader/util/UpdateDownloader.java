@@ -51,6 +51,9 @@ public final class UpdateDownloader {
     private static final int READ_TIMEOUT_MS = 30_000;
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final long PROGRESS_INTERVAL_MS = 200;
+    private static final String USER_AGENT = "OmniFetch-Updater";
+    /** 下载中断后的最大自动重试次数（优先切换线路，无其它线路时原地退避） */
+    private static final int MAX_DOWNLOAD_RETRIES = 3;
 
     private final String fileUrl;
     private final File finalFile;
@@ -136,21 +139,87 @@ public final class UpdateDownloader {
     }
 
     private void runDownload() {
+        try {
+            String effectiveUrl = selectInitialUrl();
+            int retries = 0;
+            while (true) {
+                try {
+                    downloadOnce(effectiveUrl);
+                    return;
+                } catch (java.io.IOException e) {
+                    if (cancelRequested || pauseRequested) {
+                        throw e;
+                    }
+                    if (retries >= MAX_DOWNLOAD_RETRIES) {
+                        throw e;
+                    }
+                    retries++;
+                    String next = nextRoute(effectiveUrl);
+                    if (next != null) {
+                        AppLogger.warn("更新包下载中断（" + e.getMessage() + "），切换线路继续: " + next);
+                        effectiveUrl = next;
+                        continue;
+                    }
+                    AppLogger.warn("更新包下载中断（" + e.getMessage() + "），"
+                            + retries + " 秒后原地重试");
+                    Thread.sleep(retries * 1000L);
+                    if (cancelRequested || pauseRequested) {
+                        throw e;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            handleFailure(e);
+        } finally {
+            clearWorker();
+        }
+    }
+
+    /** 首次请求地址：GitHub 链接先按加速策略选线路，探测失败退回直连 */
+    private String selectInitialUrl() {
+        if (!GitHubAccelerator.enabled() || !GitHubAccelerator.isGitHubUrl(fileUrl)) {
+            return fileUrl;
+        }
+        GitHubAccelerator.Route route = GitHubAccelerator.select(fileUrl, USER_AGENT, 10, null);
+        if (route == null) {
+            AppLogger.warn("更新包线路探测未找到可用线路，继续尝试直连");
+            return fileUrl;
+        }
+        if (route.mirror) {
+            AppLogger.info("更新包使用加速线路: " + route);
+        }
+        return route.url;
+    }
+
+    /** 下载中断后的替代线路；没有其它可用线路时返回 null（调用方原地退避重试） */
+    private String nextRoute(String currentUrl) {
+        if (!GitHubAccelerator.enabled() || !GitHubAccelerator.isGitHubUrl(fileUrl)) {
+            return null;
+        }
+        GitHubAccelerator.invalidate(fileUrl);
+        GitHubAccelerator.Route route = GitHubAccelerator.select(fileUrl, USER_AGENT, 10, currentUrl);
+        if (route == null || route.url.equals(currentUrl)) {
+            return null;
+        }
+        AppLogger.info("更新包切换线路: " + route);
+        return route.url;
+    }
+
+    /**
+     * 从指定地址下载一轮：直到完成、暂停、取消或抛错。
+     * 每次进入都按 part 文件的实际长度续传，因此切换线路/重试不会丢失已下载内容。
+     */
+    private void downloadOnce(String effectiveUrl) throws java.io.IOException {
+        if (cancelRequested) {
+            throw new java.io.IOException("下载已取消");
+        }
+        if (pauseRequested) {
+            throw new java.io.IOException("下载已暂停");
+        }
         HttpURLConnection conn = null;
         try {
             long existing = partFile.exists() ? partFile.length() : 0;
             downloaded = existing;
-
-            // GitHub 更新包：与应用内下载一致，自动选择最快可用线路（直连/内置镜像）
-            String effectiveUrl = fileUrl;
-            if (GitHubAccelerator.enabled() && GitHubAccelerator.isGitHubUrl(fileUrl)) {
-                GitHubAccelerator.Route route = GitHubAccelerator.select(
-                        fileUrl, "OmniFetch-Updater", 6, null);
-                if (route != null && route.mirror) {
-                    effectiveUrl = route.url;
-                    AppLogger.info("更新包使用加速线路: " + route);
-                }
-            }
 
             // 外层最多两轮：发现 part 文件与服务器内容不匹配（416）时删除重试一次
             for (int attempt = 0; ; attempt++) {
@@ -280,23 +349,29 @@ public final class UpdateDownloader {
                 listener.onProgress(downloaded, total > 0 ? total : downloaded, 0);
                 listener.onComplete(finalFile);
             }
-        } catch (Exception e) {
+        } finally {
             if (conn != null) {
                 conn.disconnect();
-                conn = null;
-                activeConn = null;
             }
-            if (cancelRequested) {
-                deletePartFile();
-                listener.onCancelled();
-            } else if (pauseRequested) {
-                // 暂停时主动断开连接会让阻塞 read 抛 IOException，不是错误，按已暂停处理
-                listener.onPaused();
-            } else {
-                listener.onError(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
-            }
-        } finally {
-            clearWorker();
+            activeConn = null;
+        }
+    }
+
+    /** 统一的失败收尾：按暂停/取消状态回报，其余视为下载出错 */
+    private void handleFailure(Exception e) {
+        HttpURLConnection conn = activeConn;
+        if (conn != null) {
+            conn.disconnect();
+            activeConn = null;
+        }
+        if (cancelRequested) {
+            deletePartFile();
+            listener.onCancelled();
+        } else if (pauseRequested) {
+            // 暂停时主动断开连接会让阻塞 read 抛 IOException，不是错误，按已暂停处理
+            listener.onPaused();
+        } else {
+            listener.onError(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
         }
     }
 
@@ -334,7 +409,7 @@ public final class UpdateDownloader {
         }
         conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
         conn.setReadTimeout(READ_TIMEOUT_MS);
-        conn.setRequestProperty("User-Agent", "OmniFetch-Updater");
+        conn.setRequestProperty("User-Agent", USER_AGENT);
         conn.setInstanceFollowRedirects(false); // 由调用方手动跟随
         if (existing > 0) {
             conn.setRequestProperty("Range", "bytes=" + existing + "-");
