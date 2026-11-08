@@ -39,6 +39,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JSeparator;
 import javax.swing.JTable;
 import javax.swing.JTextField;
+import javax.swing.ListSelectionModel;
 import javax.swing.RowFilter;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
@@ -47,8 +48,11 @@ import javax.swing.UIManager;
 import javax.swing.border.TitledBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.event.PopupMenuEvent;
+import javax.swing.event.PopupMenuListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableCellRenderer;
 import javax.swing.table.TableRowSorter;
 import javax.swing.text.JTextComponent;
 import java.awt.BasicStroke;
@@ -80,6 +84,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -90,7 +95,7 @@ import java.util.regex.Pattern;
 
 /**
  * 主窗口 — FlatLaf 风格 GUI
- * 多任务管理：JTable 列表 + 行内表单反馈 + Toast 通知 + 搜索过滤 + 平滑动画。
+ * 多任务管理：JTable 列表 + 行内表单反馈 + Toast 通知 + 搜索过滤 + 列排序 + 平滑动画。
  */
 public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
@@ -152,8 +157,11 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private boolean clipboardPromptShowing = false;
     /** 前景色需跟随主题的次要标签（自定义前景色不会被 updateComponentTreeUI 自动替换） */
     private final List<JLabel> hintLabels = new ArrayList<>();
-    /** 进度条渲染器不在组件树中，换肤后需手动刷新其内部组件 */
+    /** 单元格渲染器不在组件树中，换肤后需手动刷新其内部组件 */
     private ProgressTableCellRenderer progressRenderer;
+    private FileNameTableCellRenderer fileNameRenderer;
+    /** 右键选中的任务 ID：右键菜单弹出期间整行高亮，菜单关闭后清除 */
+    private String contextHighlightId;
     /** 高频进度事件合并刷新：80ms 内的多次事件只触发一次表格刷新 */
     private final Timer refreshTimer = new Timer(80, e -> {
         ((Timer) e.getSource()).stop();
@@ -420,6 +428,102 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         return UIManager.getColor("Label.disabledForeground");
     }
 
+    /** 斑马纹行背景：前景色以极低透明度混入背景色，亮暗主题均自适应 */
+    private static Color zebraBackground() {
+        return blend(UIManager.getColor("Table.background"),
+                UIManager.getColor("Table.foreground"), 0.035f);
+    }
+
+    /** 行高亮状态以复选框勾选（模型第 0 列）为准 */
+    private static boolean isRowChecked(JTable table, int viewRow) {
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        return Boolean.TRUE.equals(table.getModel().getValueAt(modelRow, 0));
+    }
+
+    /** 该行是否为右键选中的任务行 */
+    private boolean isContextRow(JTable table, int viewRow) {
+        if (contextHighlightId == null) {
+            return false;
+        }
+        int modelRow = table.convertRowIndexToModel(viewRow);
+        return contextHighlightId.equals(table.getModel().getValueAt(modelRow, 1));
+    }
+
+    /** 整行高亮条件：复选框勾选，或右键选中 */
+    private boolean isRowActive(JTable table, int viewRow) {
+        return isRowChecked(table, viewRow) || isContextRow(table, viewRow);
+    }
+
+    /**
+     * 彻底清空选中状态：clearSelection 之后 lead/anchor 仍会残留索引，
+     * FlatLaf 会据此继续绘制"当前单元格"底色，必须一并归零。
+     */
+    private static void resetSelectionState(ListSelectionModel model) {
+        if (!model.isSelectionEmpty()) {
+            model.clearSelection();
+        }
+        if (model.getLeadSelectionIndex() != -1) {
+            model.setLeadSelectionIndex(-1);
+        }
+        if (model.getAnchorSelectionIndex() != -1) {
+            model.setAnchorSelectionIndex(-1);
+        }
+    }
+
+    /** 两色按比例线性混合（不透明），UIManager 取色失败时兜底 */
+    private static Color blend(Color base, Color mix, float ratio) {
+        if (base == null) {
+            base = Color.WHITE;
+        }
+        if (mix == null) {
+            mix = Color.BLACK;
+        }
+        return new Color(
+                Math.round(base.getRed() * (1 - ratio) + mix.getRed() * ratio),
+                Math.round(base.getGreen() * (1 - ratio) + mix.getGreen() * ratio),
+                Math.round(base.getBlue() * (1 - ratio) + mix.getBlue() * ratio));
+    }
+
+    /** ID 排序键：提取 task_N 的数字后缀比较，无法解析的排到最后 */
+    private static int idOrdinal(String id) {
+        int i = id.lastIndexOf('_');
+        if (i >= 0 && i < id.length() - 1) {
+            try {
+                return Integer.parseInt(id.substring(i + 1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    /** 状态排序键：按可操作性排列（下载中→等待中→暂停→失败→完成）而非字典序 */
+    private static int statusRank(String displayName) {
+        return switch (displayName) {
+            case "下载中" -> 0;
+            case "等待中" -> 1;
+            case "暂停"   -> 2;
+            case "失败"   -> 3;
+            case "完成"   -> 4;
+            default       -> 5;
+        };
+    }
+
+    /** 协议徽章短标签（单元格宽度有限，不用完整 displayName） */
+    private static String protocolShortName(Protocol p) {
+        return switch (p) {
+            case HTTP_HTTPS -> "HTTP";
+            case MAGNET     -> "磁力";
+            case TORRENT    -> "BT";
+            case M3U8_HLS   -> "M3U8";
+            default         -> p.displayName;
+        };
+    }
+
+    /** 文件名 / 路径拼入 tooltip HTML 前的最小转义 */
+    private static String escapeHtml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
     private void initUI() {
         setTitle("万象抓取" + VersionInfo.getDisplayVersion());
         setSize(940, 650);
@@ -504,29 +608,80 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         taskModel = new DefaultTableModel(columnNames, 0) {
             @Override
             public boolean isCellEditable(int row, int column) {
-                return column == 0; // 只有复选框列可编辑
+                // 复选框列不走单元格编辑器：编辑器会单独覆盖该单元格，
+                // 导致勾选后只有部分单元格变色；改为在鼠标单击时直接切换模型值
+                return false;
             }
 
             @Override
             public Class<?> getColumnClass(int column) {
-                if (column == 0) return Boolean.class;
-                return super.getColumnClass(column);
+                // 精确列类型让 TableRowSorter 用数值比较排序，避免字符串序 "10" < "9"
+                return switch (column) {
+                    case 0 -> Boolean.class;
+                    case 3 -> Integer.class;
+                    case 4 -> Long.class;
+                    default -> String.class;
+                };
             }
         };
 
-        taskTable = new JTable(taskModel);
-        taskTable.setRowHeight(40);
+        // 行高亮以复选框勾选为准：勾选行用选中色，未勾选奇数行叠加斑马纹
+        taskTable = new JTable(taskModel) {
+            @Override
+            public Component prepareRenderer(TableCellRenderer renderer, int row, int column) {
+                Component c = super.prepareRenderer(renderer, row, column);
+                // 无论渲染器自身如何着色都强制覆盖背景：否则点击过的单元格会被渲染器
+                // 按"已选中"涂成选中色，取消勾选后仍然残留高亮
+                if (c instanceof JComponent jc) {
+                    jc.setOpaque(true);
+                }
+                if (isRowActive(this, row)) {
+                    c.setBackground(getSelectionBackground());
+                    c.setForeground(getSelectionForeground());
+                } else {
+                    c.setBackground(row % 2 == 1 ? zebraBackground() : getBackground());
+                }
+                return c;
+            }
+
+            @Override
+            public void changeSelection(int rowIndex, int columnIndex, boolean toggle, boolean extend) {
+                super.changeSelection(rowIndex, columnIndex, toggle, extend);
+                // 点击会向行/列选中模型写入状态（clearSelection 还会残留 lead/anchor），
+                // FlatLaf 据此把单元格涂成"失焦选中色"。这里把选中状态彻底归零，
+                // 确保行高亮只由复选框勾选决定
+                resetSelectionState(getSelectionModel());
+                resetSelectionState(getColumnModel().getSelectionModel());
+            }
+        };
+        taskTable.setRowHeight(46);
         taskTable.setFillsViewportHeight(true);
         taskTable.setAutoResizeMode(JTable.AUTO_RESIZE_SUBSEQUENT_COLUMNS);
         taskTable.getTableHeader().setReorderingAllowed(false);
+        // 斑马纹已提供行间分隔，关闭网格线让界面更干净
+        taskTable.setShowGrid(false);
+        taskTable.setIntercellSpacing(new Dimension(0, 0));
+        // 高亮与复选框勾选统一由 prepareRenderer 处理，彻底关闭 JTable 自带的行/列/单元格选中
+        taskTable.setRowSelectionAllowed(false);
+        taskTable.setColumnSelectionAllowed(false);
+        taskTable.setCellSelectionEnabled(false);
+        // 表格不可聚焦：否则点击单元格后 FlatLaf 会在焦点单元格上绘制高亮底色和边框
+        taskTable.setFocusable(false);
 
         taskTable.getColumnModel().getColumn(0).setPreferredWidth(40);
-        taskTable.getColumnModel().getColumn(1).setPreferredWidth(90);
+        taskTable.getColumnModel().getColumn(1).setPreferredWidth(84);
         taskTable.getColumnModel().getColumn(2).setPreferredWidth(360);
-        taskTable.getColumnModel().getColumn(3).setPreferredWidth(170);
-        taskTable.getColumnModel().getColumn(4).setPreferredWidth(120);
+        taskTable.getColumnModel().getColumn(3).setPreferredWidth(190);
+        taskTable.getColumnModel().getColumn(4).setPreferredWidth(110);
         taskTable.getColumnModel().getColumn(5).setPreferredWidth(100);
 
+        // ID 列短文本居中显示
+        DefaultTableCellRenderer idCellRenderer = new DefaultTableCellRenderer();
+        idCellRenderer.setHorizontalAlignment(SwingConstants.CENTER);
+        taskTable.getColumnModel().getColumn(1).setCellRenderer(idCellRenderer);
+
+        fileNameRenderer = new FileNameTableCellRenderer();
+        taskTable.getColumnModel().getColumn(2).setCellRenderer(fileNameRenderer);
         progressRenderer = new ProgressTableCellRenderer();
         taskTable.getColumnModel().getColumn(3).setCellRenderer(progressRenderer);
         taskTable.getColumnModel().getColumn(4).setCellRenderer(new SpeedTableCellRenderer());
@@ -544,12 +699,18 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         // 行排序器 + 搜索实时过滤
         rowSorter = new TableRowSorter<>(taskModel);
         rowSorter.setSortsOnUpdates(false); // 增量更新时不重排序，避免视觉跳动
+        rowSorter.setSortable(0, false);    // 复选框列无排序意义
+        // ID 按数字后缀排序（task_2 < task_10），字典序会错乱
+        rowSorter.setComparator(1, Comparator.comparingInt(MainWindow::idOrdinal));
+        // 状态按可操作性排序而非字典序
+        rowSorter.setComparator(5, Comparator.comparingInt(MainWindow::statusRank));
         taskTable.setRowSorter(rowSorter);
 
         // 右键菜单（打开 / 复制链接 / 暂停继续 / 删除）+ 双击定位文件
         taskTable.addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
+                toggleCheckIfClicked(e);
                 showTaskContextMenuIfNeeded(e);
             }
 
@@ -944,7 +1105,10 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         }
         // 单元格渲染器不在组件树中，需单独刷新其内部组件
         if (progressRenderer != null) {
-            SwingUtilities.updateComponentTreeUI(progressRenderer.content);
+            SwingUtilities.updateComponentTreeUI(progressRenderer);
+        }
+        if (fileNameRenderer != null) {
+            SwingUtilities.updateComponentTreeUI(fileNameRenderer);
         }
         // 自定义前景色不会被 L&F 替换，按新主题重新取色
         hintLabels.forEach(l -> l.setForeground(hintForeground()));
@@ -1208,12 +1372,50 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         if (task == null) {
             return;
         }
-        // 右键未选中的行时，先选中该行，保证菜单操作针对该任务
-        int viewRow = taskTable.rowAtPoint(e.getPoint());
-        if (taskTable.getSelectedRowCount() <= 1) {
-            taskTable.setRowSelectionInterval(viewRow, viewRow);
+        // 右键期间整行高亮，明确菜单作用于哪条任务；菜单关闭即清除，避免残留
+        contextHighlightId = task.getId();
+        taskTable.repaint();
+        JPopupMenu menu = buildTaskContextMenu(task);
+        menu.addPopupMenuListener(new PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(PopupMenuEvent ev) {
+            }
+
+            @Override
+            public void popupMenuWillBecomeInvisible(PopupMenuEvent ev) {
+                clearContextHighlight();
+            }
+
+            @Override
+            public void popupMenuCanceled(PopupMenuEvent ev) {
+                clearContextHighlight();
+            }
+        });
+        menu.show(taskTable, e.getX(), e.getY());
+    }
+
+    private void clearContextHighlight() {
+        contextHighlightId = null;
+        taskTable.repaint();
+    }
+
+    /** 单击复选框列直接切换勾选状态（该列不使用单元格编辑器） */
+    private void toggleCheckIfClicked(MouseEvent e) {
+        if (!SwingUtilities.isLeftMouseButton(e) || e.getClickCount() != 1) {
+            return;
         }
-        buildTaskContextMenu(task).show(taskTable, e.getX(), e.getY());
+        int viewRow = taskTable.rowAtPoint(e.getPoint());
+        int viewColumn = taskTable.columnAtPoint(e.getPoint());
+        if (viewRow < 0 || viewColumn != 0) {
+            return;
+        }
+        int modelRow = taskTable.convertRowIndexToModel(viewRow);
+        if (modelRow < 0) {
+            return;
+        }
+        boolean checked = Boolean.TRUE.equals(taskModel.getValueAt(modelRow, 0));
+        taskModel.setValueAt(!checked, modelRow, 0);
+        taskTable.repaint();
     }
 
     /** 按任务当前状态构建右键菜单 */
@@ -2287,7 +2489,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             Object[] data = {
                     selectedTasks.getOrDefault(task.getId(), false),
                     task.getId(),
-                    task.getFileName(),
+                    // 文件名未获取时以空串兜底：排序时 Collator 遇 null 会抛 NPE
+                    task.getFileName() != null ? task.getFileName() : "",
                     task.getProgress(),
                     task.getSpeed(),
                     task.getStatus().getDisplayName()
@@ -2415,32 +2618,168 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     // ══════════════════════════════════════════
 
     /**
-     * 进度列：FlatLaf 圆角进度条，百分比字符串绘制在进度条内部（setStringPainted）。
-     * 填充区/未填充区的文字对比色由 FlatLaf 按亮暗主题自动计算（ProgressBar.selectionForeground/Background），
-     * 无需手动适配主题。
+     * 文件名列：协议小徽章 + 文件名（超宽自动省略号截断）。
+     * 协议按任务 ID 反查（任务已删除时降级为纯文本）；
+     * 悬停 tooltip 显示完整文件名与保存目录，弥补列宽截断。
      */
-    private class ProgressTableCellRenderer extends DefaultTableCellRenderer {
-        final JPanel content = new JPanel(new BorderLayout());
-        private final JProgressBar progressBar;
+    private class FileNameTableCellRenderer extends JPanel implements TableCellRenderer {
 
-        ProgressTableCellRenderer() {
-            progressBar = new JProgressBar(0, 100);
-            progressBar.setStringPainted(true);
-            // 高度略增保证内部文字可读（行高 40 足够），宽度占满单元格
-            progressBar.setPreferredSize(new Dimension(120, 18));
+        private final MiniBadge badge = new MiniBadge();
+        private final JLabel nameLabel = new JLabel();
 
-            content.add(progressBar, BorderLayout.CENTER);
-            content.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
+        FileNameTableCellRenderer() {
+            super(new BorderLayout(8, 0));
+            setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 4));
+            add(nameLabel, BorderLayout.CENTER); // JLabel 文本超宽自动以 … 截断
         }
 
         @Override
-        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
+        public Component getTableCellRendererComponent(JTable table, Object value,
+                boolean isSelected, boolean hasFocus, int row, int column) {
+            String fileName = value instanceof String s ? s : "";
+            nameLabel.setText(fileName);
+
+            int modelRow = table.convertRowIndexToModel(row);
+            Object id = table.getModel().getValueAt(modelRow, 1);
+            DownloadTask task = id instanceof String taskId ? downloadManager.getTask(taskId) : null;
+
+            Protocol protocol = task != null ? task.getProtocol() : null;
+            if (protocol != null && protocol != Protocol.UNKNOWN) {
+                badge.set(protocolShortName(protocol), badgeColorFor(protocol));
+                // BorderLayout 会给不可见组件保留占位，无协议时必须从布局中移除
+                if (badge.getParent() == null) {
+                    add(badge, BorderLayout.WEST);
+                }
+            } else if (badge.getParent() != null) {
+                remove(badge);
+            }
+
+            String savePath = task != null ? task.getSavePath() : null;
+            if (fileName.isEmpty()) {
+                setToolTipText(null);
+            } else if (savePath != null && !savePath.isBlank()) {
+                setToolTipText("<html>" + escapeHtml(fileName)
+                        + "<br>保存至：" + escapeHtml(savePath) + "</html>");
+            } else {
+                setToolTipText(fileName);
+            }
+
+            boolean active = isRowActive(table, row);
+            nameLabel.setForeground(active ? table.getSelectionForeground() : table.getForeground());
+            setBackground(active ? table.getSelectionBackground() : table.getBackground());
+            return this;
+        }
+    }
+
+    /** 协议小徽章：固定 18px 高胶囊，宽度随文字自适应，配色与顶部协议徽章一致 */
+    private final class MiniBadge extends JPanel {
+        private String text = "";
+        private Color color = BADGE_UNKNOWN;
+
+        MiniBadge() {
+            setOpaque(false);
+        }
+
+        @Override
+        public void updateUI() {
+            super.updateUI();
+            // 换肤后随全局标签字体同步缩放
+            Font base = UIManager.getFont("Label.font");
+            if (base != null) {
+                setFont(base.deriveFont(Font.PLAIN, 11f));
+            }
+        }
+
+        void set(String t, Color c) {
+            text = t;
+            color = c;
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            if (text.isEmpty()) {
+                return new Dimension(0, 0);
+            }
+            FontMetrics fm = getFontMetrics(getFont());
+            return new Dimension(fm.stringWidth(text) + 12, 18);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            if (text.isEmpty()) {
+                return;
+            }
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            FontMetrics fm = g.getFontMetrics();
+            int bw = fm.stringWidth(text) + 12;
+            int bh = 18;
+            int by = (getHeight() - bh) / 2;
+
+            g.setColor(UiAnim.withAlpha(color, 26));
+            g.fillRoundRect(0, by, bw, bh, bh, bh);
+            g.setColor(UiAnim.withAlpha(color, 90));
+            g.setStroke(new BasicStroke(1f));
+            g.drawRoundRect(0, by, bw - 1, bh - 1, bh, bh);
+            g.setColor(color);
+            g.drawString(text, 6, by + (bh - fm.getHeight()) / 2 + fm.getAscent());
+            g.dispose();
+        }
+    }
+
+    /**
+     * 进度列：上行进度条（百分比文字在条内，填充区/未填充区对比色由 FlatLaf 按主题自动计算），
+     * 下行小字显示已下载 / 总大小。总大小未知（如 m3u8）时只显示已下载量，未开始时下行留空。
+     */
+    private class ProgressTableCellRenderer extends JPanel implements TableCellRenderer {
+        private final JProgressBar progressBar = new JProgressBar(0, 100);
+        private final JLabel sizeLabel = new JLabel() {
+            @Override
+            public void updateUI() {
+                super.updateUI();
+                // 下行信息用小字号弱化；L&F 重置字体后随换肤重新派生
+                Font base = UIManager.getFont("Label.font");
+                if (base != null) {
+                    setFont(base.deriveFont(base.getSize2D() - 1.5f));
+                }
+            }
+        };
+
+        ProgressTableCellRenderer() {
+            super(new BorderLayout(0, 2));
+            setBorder(BorderFactory.createEmptyBorder(5, 8, 5, 8));
+            progressBar.setStringPainted(true);
+            sizeLabel.setHorizontalAlignment(SwingConstants.CENTER);
+            add(progressBar, BorderLayout.CENTER);
+            add(sizeLabel, BorderLayout.SOUTH);
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value,
+                boolean isSelected, boolean hasFocus, int row, int column) {
             if (value instanceof Integer progress) {
                 progressBar.setValue(progress);
-                content.setBackground(isSelected ? table.getSelectionBackground() : table.getBackground());
-                return content;
+                progressBar.setString(progress + "%");
             }
-            return super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+
+            int modelRow = table.convertRowIndexToModel(row);
+            Object id = table.getModel().getValueAt(modelRow, 1);
+            DownloadTask task = id instanceof String taskId ? downloadManager.getTask(taskId) : null;
+
+            long total = task != null ? task.getTotalSize() : -1;
+            long downloaded = task != null ? task.getDownloadedSize() : 0;
+            if (total > 0) {
+                sizeLabel.setText(FileUtils.formatSize(downloaded) + " / " + FileUtils.formatSize(total));
+            } else if (downloaded > 0) {
+                sizeLabel.setText(FileUtils.formatSize(downloaded));
+            } else {
+                sizeLabel.setText("");
+            }
+            boolean active = isRowActive(table, row);
+            sizeLabel.setForeground(active ? table.getSelectionForeground() : hintForeground());
+
+            setBackground(active ? table.getSelectionBackground() : table.getBackground());
+            return this;
         }
     }
 
