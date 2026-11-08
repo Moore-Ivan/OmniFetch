@@ -141,13 +141,24 @@ public final class UpdateDownloader {
             long existing = partFile.exists() ? partFile.length() : 0;
             downloaded = existing;
 
+            // GitHub 更新包：与应用内下载一致，自动选择最快可用线路（直连/内置镜像）
+            String effectiveUrl = fileUrl;
+            if (GitHubAccelerator.enabled() && GitHubAccelerator.isGitHubUrl(fileUrl)) {
+                GitHubAccelerator.Route route = GitHubAccelerator.select(
+                        fileUrl, "OmniFetch-Updater", 6, null);
+                if (route != null && route.mirror) {
+                    effectiveUrl = route.url;
+                    AppLogger.info("更新包使用加速线路: " + route);
+                }
+            }
+
             // 外层最多两轮：发现 part 文件与服务器内容不匹配（416）时删除重试一次
             for (int attempt = 0; ; attempt++) {
                 // 手动跟随重定向：GitHub 资产会 302 到 objects.githubusercontent.com。
                 // 不用自动跟随的原因：
                 // 1) 自动跟随打开的新连接不会继承 HttpTrust 的信任配置（精简 JRE cacerts 不全时重定向后 PKIX）；
                 // 2) 手动跟随可在连接被拒时指出具体主机（hosts 失效/代理未开/防火墙的排查依据）
-                String currentUrl = fileUrl;
+                String currentUrl = effectiveUrl;
                 int code;
                 int redirects = 0;
                 while (true) {

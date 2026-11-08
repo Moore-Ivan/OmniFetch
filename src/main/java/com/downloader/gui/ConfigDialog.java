@@ -32,6 +32,8 @@ public class ConfigDialog extends JDialog {
     private final Map<String, JPanel> groupPanels = new LinkedHashMap<>();
     /** 前景色需跟随主题的次要标签（范围提示、说明文字等） */
     private final List<JLabel> hintLabels = new ArrayList<>();
+    /** 标签列宽（各分组统一，构建表单时按最长标签计算） */
+    private int labelWidth = 180;
     private JLabel pathHint;
 
     public ConfigDialog(Window owner) {
@@ -58,6 +60,13 @@ public class ConfigDialog extends JDialog {
         content.add(pathHint);
 
         // 按分组构建表单（保持注册顺序）
+        // 标签列宽在各分组间保持一致：取所有标签的最大自然宽度（限制在合理区间），
+        // 避免"文字长的分组"单独把整列推宽、各分组控件起始位置参差不齐
+        labelWidth = 180;
+        for (ConfigItem item : configManager.getConfigItems()) {
+            int width = new JLabel(labelText(item)).getPreferredSize().width;
+            labelWidth = Math.max(labelWidth, Math.min(width, 250));
+        }
         for (ConfigItem item : configManager.getConfigItems()) {
             JPanel groupPanel = groupPanels.computeIfAbsent(item.group, this::createGroupPanel);
             addItemRow(groupPanel, item);
@@ -167,6 +176,11 @@ public class ConfigDialog extends JDialog {
         return label;
     }
 
+    /** 标签文案（含单位后缀），供布局测量与实际渲染复用 */
+    private String labelText(ConfigItem item) {
+        return item.label + (item.unit != null ? "（" + item.unit + "）" : "");
+    }
+
     private void addItemRow(JPanel groupPanel, ConfigItem item) {
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.insets = new Insets(6, 6, 6, 6);
@@ -177,8 +191,13 @@ public class ConfigDialog extends JDialog {
         // 标签列
         gbc.gridx = 0;
         gbc.weightx = 0;
-        JLabel label = new JLabel(item.label + (item.unit != null ? "（" + item.unit + "）" : ""));
-        label.setPreferredSize(new Dimension(180, label.getPreferredSize().height));
+        JLabel label = new JLabel(labelText(item));
+        // 同时锁定最小/首选宽度：只锁首选宽度时，超长标签的最小宽度会撑宽整列，
+        // 导致不同分组的控件起始位置不一致
+        Dimension labelSize = new Dimension(labelWidth, label.getPreferredSize().height);
+        label.setPreferredSize(labelSize);
+        label.setMinimumSize(labelSize);
+        label.setToolTipText(labelText(item));
         groupPanel.add(label, gbc);
 
         // 输入控件列（不拉伸，保持自然宽度，避免挤压范围列）
@@ -231,6 +250,8 @@ public class ConfigDialog extends JDialog {
                         ? MainWindow.resolveDefaultSaveDir()
                         : configManager.getString(item.key, item.defaultValue);
                 JTextField textField = new JTextField(initial, 14);
+                // 文本框内容较长时默认滚动到末尾（只显示尾部），这里固定从开头显示
+                textField.setCaretPosition(0);
                 textField.setToolTipText(item.directory
                         ? "默认值：" + item.defaultValue + "（相对路径按程序根目录解析）"
                         : "默认值：" + (item.defaultValue.isEmpty() ? "（空）" : item.defaultValue));
@@ -254,6 +275,12 @@ public class ConfigDialog extends JDialog {
                     gbc.insets = new Insets(0, 6, 6, 6); // 紧贴标签行，间距由标签行底部提供
                     groupPanel.add(pathPanel, gbc);
                 } else {
+                    // 字符串值可能较长（User-Agent、镜像列表等）：占满剩余宽度，
+                    // 避免输入框过窄只显示一小段内容
+                    gbc.gridx = 1;
+                    gbc.gridwidth = GridBagConstraints.REMAINDER;
+                    gbc.weightx = 1;
+                    gbc.fill = GridBagConstraints.HORIZONTAL;
                     groupPanel.add(textField, gbc);
                 }
             }
@@ -276,7 +303,9 @@ public class ConfigDialog extends JDialog {
         gbc.gridx = 0;
         gbc.weightx = 0;
         JLabel spacer = new JLabel();
-        spacer.setPreferredSize(new Dimension(180, spacer.getPreferredSize().height));
+        Dimension spacerSize = new Dimension(labelWidth, spacer.getPreferredSize().height);
+        spacer.setPreferredSize(spacerSize);
+        spacer.setMinimumSize(spacerSize);
         groupPanel.add(spacer, gbc);
 
         gbc.gridx = 1;

@@ -298,7 +298,7 @@ tasks.register('myJpackage', Exec) {
             '--vendor', vendor,
             '--install-dir', appName,
             '--copyright', "Copyright @ ${vendor}",
-            '--description', "一个功能强大的多协议下载管理器，支持 HTTP、HTTPS、FTP、SFTP、BitTorrent 和 M3U8 等多种协议，提供直观的图形界面和丰富的下载管理功能",
+            '--description', "A powerful multi-protocol download manager supporting HTTP, HTTPS, FTP, SFTP, BitTorrent, M3U8, and more, featuring an intuitive graphical user interface and comprehensive download management capabilities.",
             '--input', libDir.absolutePath,
             '--main-jar', mainJar,
             '--main-class', mainClass,

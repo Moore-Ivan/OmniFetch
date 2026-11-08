@@ -106,9 +106,16 @@ public class ConfigManager {
         directory("下载配置", "download.defaultSaveDir", "保存路径", "downloads");
         // HTTP配置
         number("HTTP配置", "http.maxThreads", "HTTP最大线程数", "个", 1, 128, 1, 16);
-        number("HTTP配置", "http.minChunkSize", "最小分片大小", "字节", 65_536, 104_857_600, 65_536, 5_242_880);
         number("HTTP配置", "http.maxChunkSize", "最大分片大小", "字节", 1_048_576, 536_870_912, 1_048_576, 52_428_800);
         text("HTTP配置", "http.userAgent", "User-Agent", "Mozilla/5.0 (MultiProtocolDownloader/2.0)");
+        // 网络代理（本地无法直连 GitHub 时使用）
+        bool("网络代理", "network.proxyEnabled", "启用代理（直连失败时自动使用）", true);
+        text("网络代理", "network.proxyHost", "代理主机（留空自动检测）", "");
+        number("网络代理", "network.proxyPort", "代理端口", "端口", 1, 65_535, 1, 7_890);
+        text("网络代理", "network.proxyType", "代理类型（http/socks）", "http");
+        // GitHub 加速（应用内自动选择直连/镜像线路，无需安装第三方工具）
+        bool("GitHub 加速", "network.githubAccelerator", "自动选择最快线路", true);
+        text("GitHub 加速", "network.githubMirrors", "加速镜像（留空用内置）", "");
         // FTP/SFTP配置
         number("FTP/SFTP配置", "ftp.maxConnections", "最大连接数", "个", 1, 50, 1, 10);
         number("FTP/SFTP配置", "ftp.connectionTimeoutSec", "连接超时", "秒", 1, 300, 1, 30);
