@@ -11,6 +11,7 @@ public enum Protocol {
     MAGNET("磁力链接", "magnet"),
     TORRENT("BitTorrent", ".torrent"),
     M3U8_HLS("m3u8/HLS", "m3u8"),
+    CLOUD("网盘直链", "cloud"),
     UNKNOWN("未知协议", "");
 
     public final String displayName;

@@ -350,7 +350,7 @@ public class ConfigDialog extends JDialog {
 
     /**
      * 弹出系统目录选择器，选择后将绝对路径回填到指定输入框。
-     * 初始目录优先使用输入框当前值（须为已存在目录），否则回退用户主目录。
+     * 初始目录优先使用输入框当前值（须为已存在目录），否则回退用户下载文件夹。
      */
     private void chooseDirectory(JTextField target) {
         JFileChooser chooser = new JFileChooser();
@@ -361,7 +361,7 @@ public class ConfigDialog extends JDialog {
         if (current.isDirectory()) {
             chooser.setCurrentDirectory(current);
         } else {
-            chooser.setCurrentDirectory(new File(System.getProperty("user.home")));
+            chooser.setCurrentDirectory(MainWindow.defaultBrowseDir());
         }
         if (chooser.showDialog(this, "选择") == JFileChooser.APPROVE_OPTION) {
             target.setText(chooser.getSelectedFile().getAbsolutePath());

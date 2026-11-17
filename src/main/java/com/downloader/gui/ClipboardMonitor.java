@@ -1,5 +1,6 @@
 package com.downloader.gui;
 
+import com.downloader.cloud.CloudRegistry;
 import com.downloader.detector.ProtocolDetector;
 import com.downloader.model.Protocol;
 
@@ -66,9 +67,11 @@ final class ClipboardMonitor {
             return;
         }
         text = text.trim();
-        // 空文本、多行文本、超长文本都不可能是单个下载链接：只记录，不做协议检测
-        if (text.isEmpty() || text.contains("\n") || text.contains("\r")
-                || text.length() > MAX_LENGTH) {
+        // 网盘分享文案常带「链接: … 提取码: …」的多行文本，可跨行识别
+        boolean cloudShare = CloudRegistry.detect(text) != null;
+        // 空文本、普通多行文本、超长文本都不可能是单个下载链接：只记录，不做协议检测
+        if (text.isEmpty() || text.length() > MAX_LENGTH
+                || (!cloudShare && (text.contains("\n") || text.contains("\r"))) ) {
             lastText = text;
             firstPoll = false;
             return;
@@ -81,7 +84,7 @@ final class ClipboardMonitor {
             firstPoll = false;
             return;
         }
-        if (ProtocolDetector.detect(text) == Protocol.UNKNOWN) {
+        if (!cloudShare && ProtocolDetector.detect(text) == Protocol.UNKNOWN) {
             return;
         }
         onLinkDetected.accept(text);

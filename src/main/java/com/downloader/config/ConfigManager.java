@@ -126,6 +126,21 @@ public class ConfigManager {
         // 剪贴板配置
         bool("剪贴板配置", "clipboard.monitorEnabled", "自动识别剪贴板下载链接", true);
         number("剪贴板配置", "clipboard.pollIntervalMs", "剪贴板检测间隔", "毫秒", 200, 10_000, 100, 1_000);
+        // 网盘凭据（浏览器 Cookie 文本；123/蓝奏/光鸭等公开分享可留空）
+        text("网盘凭据", "cloud.userAgent",
+                "网盘请求 User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+        text("网盘凭据", "cloud.cookie.quark", "夸克 Cookie", "");
+        text("网盘凭据", "cloud.cookie.uc", "UC Cookie", "");
+        text("网盘凭据", "cloud.cookie.xunlei", "迅雷 Cookie", "");
+        text("网盘凭据", "cloud.cookie.baidu", "百度 Cookie（含 BDUSS）", "");
+        text("网盘凭据", "cloud.cookie.139", "139 Cookie", "");
+        text("网盘凭据", "cloud.cookie.115", "115 Cookie", "");
+        text("网盘凭据", "cloud.cookie.123", "123 Cookie", "");
+        text("网盘凭据", "cloud.cookie.guangya", "光鸭 Cookie", "");
+        text("网盘凭据", "cloud.cookie.lanzou", "蓝奏云 Cookie", "");
+        text("网盘凭据", "cloud.cookie.ilanzou", "蓝奏优享 Cookie", "");
     }
 
     private static ConfigManager instance;
@@ -296,6 +311,18 @@ public class ConfigManager {
         loadPropertiesConfig(configPath);
         // 通知监听者（如下载管理器线程池）热更新
         EventBus.getInstance().publishConfigChangeEvent(new ConfigChangeEvent(configPath.toString()));
+    }
+
+    /**
+     * 单独更新一个配置项（网盘解析窗口保存 Cookie 时使用），其余项保持不变。
+     */
+    public synchronized void setValue(String key, String value) throws IOException {
+        Map<String, String> values = new HashMap<>();
+        for (ConfigItem item : ITEMS) {
+            values.put(item.key, getString(item.key, item.defaultValue));
+        }
+        values.put(key, value == null ? "" : value);
+        saveConfig(values);
     }
 
     /**

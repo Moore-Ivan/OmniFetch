@@ -68,6 +68,10 @@ public final class DownloaderFactory {
             case M3U8_HLS:
                 return new M3u8Downloader(url, savePath, callback, limiter);
 
+            case CLOUD:
+                return new CloudDownloader(url, savePath, callback,
+                        downloadedSize, saveFilePath, limiter);
+
             case MAGNET:
             case TORRENT:
                 // saveFilePath：续传/重试时复用上次实际落盘路径，避免重下生成新文件名

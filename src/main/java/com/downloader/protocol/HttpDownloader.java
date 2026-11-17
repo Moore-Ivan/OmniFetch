@@ -21,6 +21,7 @@ import java.time.Duration;
 import javax.net.ssl.SSLHandshakeException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -52,6 +53,10 @@ public class HttpDownloader implements DownloadProtocol {
     private String saveFilePath;
     /** 任务级限速器（字节/秒，0=不限）；可为 null（插件/旧构造通道） */
     private final RateLimiter limiter;
+    /** 网盘直链等场景需要的额外请求头（Cookie/Referer/Origin/UA 等） */
+    private final Map<String, String> extraHeaders;
+    /** 优先使用的文件名（网盘直链常为无意义路径，需要由解析结果指定） */
+    private final String preferredFileName;
 
     /**
      * 实际下载地址：GitHub release 原始链接会 302 到带签名的 CDN 地址
@@ -103,8 +108,47 @@ public class HttpDownloader implements DownloadProtocol {
     }
 
     private String getUserAgent() {
+        // 网盘直链对 UA 有要求（如百度要求 netdisk），解析器指定的 UA 优先
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                if (e.getKey() != null && "user-agent".equalsIgnoreCase(e.getKey())
+                        && e.getValue() != null && !e.getValue().isBlank()) {
+                    return e.getValue();
+                }
+            }
+        }
         return configManager.getString("http.userAgent",
                 "Mozilla/5.0 (MultiProtocolDownloader/2.0)");
+    }
+
+    /**
+     * 统一的基础请求构造：UA/Accept/超时 + 网盘直链附加头。
+     * 附加头中的 UA 由 {@link #getUserAgent()} 覆盖，不重复写入。
+     */
+    private HttpRequest.Builder baseRequestBuilder(String url) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("User-Agent", getUserAgent())
+                .header("Accept", "*/*")
+                // 显式要求不压缩传输：压缩响应会让落盘内容与原始文件不一致
+                .header("Accept-Encoding", "identity")
+                .timeout(Duration.ofSeconds(getResponseTimeoutSec()));
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                String key = e.getKey();
+                if (key == null || key.isBlank() || e.getValue() == null) {
+                    continue;
+                }
+                String lower = key.toLowerCase();
+                if ("user-agent".equals(lower) || "accept".equals(lower)
+                        || "accept-encoding".equals(lower) || "range".equals(lower)
+                        || "host".equals(lower) || "content-length".equals(lower)) {
+                    continue;
+                }
+                builder.header(key, e.getValue());
+            }
+        }
+        return builder;
     }
 
     public HttpDownloader(String fileURL, String savePath,
@@ -125,12 +169,25 @@ public class HttpDownloader implements DownloadProtocol {
     public HttpDownloader(String fileURL, String savePath,
                           ProgressCallback callback, long downloadedSize, String saveFilePath,
                           RateLimiter limiter) {
+        this(fileURL, savePath, callback, downloadedSize, saveFilePath, limiter, null, null);
+    }
+
+    /**
+     * 网盘直链通道：额外请求头用于 Cookie/Referer 等鉴权，
+     * preferredFileName 用于保证落盘文件名与网盘中的文件名一致。
+     */
+    public HttpDownloader(String fileURL, String savePath,
+                          ProgressCallback callback, long downloadedSize, String saveFilePath,
+                          RateLimiter limiter, Map<String, String> extraHeaders,
+                          String preferredFileName) {
         this.fileURL = fileURL;
         this.savePath = savePath;
         this.callback = callback;
         this.downloadedSize = downloadedSize;
         this.saveFilePath = saveFilePath;
         this.limiter = limiter;
+        this.extraHeaders = extraHeaders;
+        this.preferredFileName = preferredFileName;
     }
 
     /**
@@ -164,15 +221,20 @@ public class HttpDownloader implements DownloadProtocol {
         return clientBuilder.build();
     }
 
+    /**
+     * 判定落盘文件名：网盘直链的 URL 往往是无意义的签名路径，
+     * 优先采用解析结果中的文件名，避免下载成 hash/数字文件名。
+     */
+    private String resolveFileName(String contentDisposition) {
+        if (preferredFileName != null && !preferredFileName.isBlank()) {
+            return preferredFileName;
+        }
+        return FileUtils.extractFileName(contentDisposition, fileURL);
+    }
+
     /** 构建元数据 HEAD 请求（地址可能因线路切换/地址刷新而变化，因此每次重新构建） */
     private HttpRequest buildHeadRequest() {
-        return HttpRequest.newBuilder()
-                .uri(URI.create(currentDownloadUrl()))
-                .header("User-Agent", getUserAgent())
-                .header("Accept", "*/*")
-                // 显式要求不压缩传输：压缩响应会让落盘内容与原始文件不一致
-                .header("Accept-Encoding", "identity")
-                .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
+        return baseRequestBuilder(currentDownloadUrl())
                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                 .build();
     }
@@ -267,12 +329,7 @@ public class HttpDownloader implements DownloadProtocol {
             HttpClient probeClient = newHttpClient();
             try {
                 HttpResponse<Void> resp = probeClient.send(
-                        HttpRequest.newBuilder()
-                                .uri(URI.create(entryUrl))
-                                .header("User-Agent", getUserAgent())
-                                .header("Accept", "*/*")
-                                .header("Accept-Encoding", "identity")
-                                .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
+                        baseRequestBuilder(entryUrl)
                                 .method("HEAD", HttpRequest.BodyPublishers.noBody())
                                 .build(),
                         HttpResponse.BodyHandlers.discarding());
@@ -330,11 +387,7 @@ public class HttpDownloader implements DownloadProtocol {
         HttpClient client = newHttpClient();
         try {
             HttpResponse<InputStream> response = client.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(currentDownloadUrl()))
-                            .header("User-Agent", getUserAgent())
-                            .header("Accept", "*/*")
-                            .header("Accept-Encoding", "identity")
+                    baseRequestBuilder(currentDownloadUrl())
                             .header("Range", "bytes=0-0")
                             .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                             .GET()
@@ -514,9 +567,8 @@ public class HttpDownloader implements DownloadProtocol {
 
             if (headResponse.statusCode() >= 200 && headResponse.statusCode() < 300) {
                 rememberResolvedUrl(headResponse.uri());
-                fileName = FileUtils.extractFileName(
-                        headResponse.headers().firstValue("Content-Disposition").orElse(null),
-                        fileURL);
+                fileName = resolveFileName(
+                        headResponse.headers().firstValue("Content-Disposition").orElse(null));
                 totalSize = headResponse.headers()
                         .firstValueAsLong("Content-Length").orElse(-1);
                 // 仅 Accept-Ranges: bytes 视为支持续传（缺失或 none 都按不支持处理）
@@ -528,11 +580,7 @@ public class HttpDownloader implements DownloadProtocol {
                 // HEAD 被拒（部分服务器对 HEAD 返回 403/405，但 GET 完全可用）：
                 // 退化用 GET bytes=0-0 探测文件名/大小/Range 支持
                 HttpResponse<InputStream> probe = probeClient.send(
-                        HttpRequest.newBuilder()
-                                .uri(URI.create(currentDownloadUrl()))
-                                .header("User-Agent", getUserAgent())
-                                .header("Accept", "*/*")
-                                .header("Accept-Encoding", "identity")
+                        baseRequestBuilder(currentDownloadUrl())
                                 .header("Range", "bytes=0-0")
                                 .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                                 .GET()
@@ -557,9 +605,8 @@ public class HttpDownloader implements DownloadProtocol {
                         throw new IOException("HTTP " + headResponse.statusCode()
                                 + "（HEAD）/ " + code + "（GET 探测）");
                     }
-                    fileName = FileUtils.extractFileName(
-                            probe.headers().firstValue("Content-Disposition").orElse(null),
-                            fileURL);
+                    fileName = resolveFileName(
+                            probe.headers().firstValue("Content-Disposition").orElse(null));
                     version = probe.version();
                     rememberResolvedUrl(probe.uri());
                 }
@@ -796,11 +843,7 @@ public class HttpDownloader implements DownloadProtocol {
         long bytesRead = 0;
         int testDuration = 2000; // 测试2秒，减少测试时间
         
-        HttpRequest testRequest = HttpRequest.newBuilder()
-                .uri(URI.create(currentDownloadUrl()))
-                .header("User-Agent", getUserAgent())
-                .header("Accept", "*")
-                .header("Accept-Encoding", "identity")
+        HttpRequest testRequest = baseRequestBuilder(currentDownloadUrl())
                 .header("Range", "bytes=0-2097151") // 测试2MB，增加测试数据量
                 .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                 .GET()
@@ -1011,11 +1054,7 @@ public class HttpDownloader implements DownloadProtocol {
         try {
             String requestUrl = currentDownloadUrl();
             long epoch = refreshEpoch;
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(requestUrl))
-                    .header("User-Agent", getUserAgent())
-                    .header("Accept", "*/*")
-                    .header("Accept-Encoding", "identity")
+            HttpRequest request = baseRequestBuilder(requestUrl)
                     .header("Range", "bytes=" + requestStart + "-" + end)
                     .timeout(Duration.ofSeconds(getResponseTimeoutSec()))
                     .GET()
@@ -1277,12 +1316,7 @@ public class HttpDownloader implements DownloadProtocol {
 
         long start = downloadedSize;
 
-        HttpRequest.Builder builder = HttpRequest.newBuilder()
-                .uri(URI.create(currentDownloadUrl()))
-                .header("User-Agent", getUserAgent())
-                .header("Accept", "*/*")
-                .header("Accept-Encoding", "identity")
-                .timeout(Duration.ofSeconds(getResponseTimeoutSec()));
+        HttpRequest.Builder builder = baseRequestBuilder(currentDownloadUrl());
         if (start > 0) {
             // 支持断点续传，发送Range请求
             builder.header("Range", "bytes=" + start + "-");

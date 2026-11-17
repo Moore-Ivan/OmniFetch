@@ -16,6 +16,10 @@ public final class ProtocolDetector {
 
         String lower = input.toLowerCase().trim();
 
+        // 网盘任务描述（cloud:// + Base64），直链由解析器在下载前重新换取
+        if (lower.startsWith("cloud://")) {
+            return Protocol.CLOUD;
+        }
         if (lower.startsWith("magnet:")) {
             return Protocol.MAGNET;
         }

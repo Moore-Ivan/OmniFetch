@@ -1,6 +1,8 @@
 package com.downloader.gui;
 
 import com.downloader.Main;
+import com.downloader.cloud.CloudProvider;
+import com.downloader.cloud.CloudRegistry;
 import com.downloader.config.ConfigManager;
 import com.downloader.detector.ProtocolDetector;
 import com.downloader.event.EventBus;
@@ -109,6 +111,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
     private static final Color BADGE_SFTP    = new Color(40, 180, 130);
     private static final Color BADGE_TORRENT = new Color(200, 70, 90);
     private static final Color BADGE_M3U8    = new Color(160, 80, 200);
+    private static final Color BADGE_CLOUD   = new Color(88, 96, 214);
     private static final Color BADGE_UNKNOWN = new Color(128, 132, 144);
 
     /** 应用版本号（由 VersionInfo 从 version.properties 读取，与 build.gradle cfgVersion 一致） */
@@ -275,6 +278,12 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             }
             setVisible(true);
             toFront();
+
+            // 网盘分享链接无法直接入队，先打开解析窗口让用户选文件
+            if (CloudRegistry.detect(url) != null) {
+                new CloudParseDialog(this, downloadManager, url).setVisible(true);
+                return;
+            }
 
             String display = url.length() > 120 ? url.substring(0, 117) + "..." : url;
             // parent 传 null：与退出确认同理，owner 归属在主窗口最小化/恢复动画期间
@@ -515,6 +524,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             case MAGNET     -> "磁力";
             case TORRENT    -> "BT";
             case M3U8_HLS   -> "M3U8";
+            case CLOUD      -> "网盘";
             default         -> p.displayName;
         };
     }
@@ -526,9 +536,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
 
     private void initUI() {
         setTitle("万象抓取" + VersionInfo.getDisplayVersion());
-        setSize(940, 650);
-        // 关键：禁用 JFrame 默认关闭行为，由 windowClosing 手动处理，
-        // 点击取消时窗口不关闭
+        setSize(920, 620);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setMinimumSize(new Dimension(760, 560));
         setLocationRelativeTo(null);
@@ -549,13 +557,18 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         pauseBtn = outlineButton("暂停", UiIcons.pause(), WARNING);
         resumeBtn = outlineButton("继续", UiIcons.resume(), SUCCESS);
         deleteBtn = outlineButton("删除", UiIcons.delete(), DANGER);
+        JButton cloudBtn = toolButton("网盘解析", UiIcons.folder());
+        cloudBtn.setToolTipText("解析夸克 / UC / 迅雷 / 百度 / 139 / 123 / 115 / 光鸭 / 蓝奏云分享链接");
+        cloudBtn.addActionListener(e -> new CloudParseDialog(this, downloadManager,
+                urlField.getText().trim()).setVisible(true));
         leftButtons.add(addBtn);
+        leftButtons.add(cloudBtn);
         leftButtons.add(selectAllBtn);
         leftButtons.add(pauseBtn);
         leftButtons.add(resumeBtn);
         leftButtons.add(deleteBtn);
 
-        // 右侧：搜索（实时过滤） + 主题切换 + 高级配置
+        // 右侧：搜索（实时过滤）
         JPanel rightTools = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         searchField = new JTextField(18);
         searchField.putClientProperty("JTextField.placeholderText", "搜索文件名 / ID / 状态");
@@ -569,15 +582,6 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         searchField.putClientProperty("JTextField.trailingComponent", clearSearchBtn);
         onTextChange(searchField, this::applySearch);
         rightTools.add(searchField);
-
-        themeBtn = toolButton(themeModeLabel(), themeModeIcon());
-        themeBtn.setToolTipText("切换主题模式：浅色 / 深色 / 跟随系统");
-        themeBtn.addActionListener(e -> showThemeMenu());
-        rightTools.add(themeBtn);
-
-        JButton configBtn = toolButton("高级配置", UiIcons.settings());
-        configBtn.addActionListener(e -> new ConfigDialog(this).setVisible(true));
-        rightTools.add(configBtn);
 
         // 中部：协议徽章
         protocolBadge = new BadgeLabel("待检测", BADGE_UNKNOWN);
@@ -766,11 +770,18 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         credentialsWrapper.setVisible(false);
         controlPanel.add(credentialsWrapper);
 
-        // 检查更新 + 联系作者 + 退出按钮
+        // 检查更新 + 主题切换 + 高级配置 + 联系作者 + 退出按钮
         JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
         btnRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         updateBtn = toolButton("检查更新", UiIcons.update());
         btnRow.add(updateBtn);
+        themeBtn = toolButton(themeModeLabel(), themeModeIcon());
+        themeBtn.setToolTipText("切换主题模式：浅色 / 深色 / 跟随系统");
+        themeBtn.addActionListener(e -> showThemeMenu());
+        btnRow.add(themeBtn);
+        JButton configBtn = toolButton("高级配置", UiIcons.settings());
+        configBtn.addActionListener(e -> new ConfigDialog(this).setVisible(true));
+        btnRow.add(configBtn);
         contactBtn = toolButton("联系作者", UiIcons.contact());
         btnRow.add(contactBtn);
         exitBtn = toolButton("退出", UiIcons.power());
@@ -853,9 +864,23 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         if (dir.isEmpty()) {
             dir = "downloads";
         }
-        File f = new File(dir);
-        return f.isAbsolute() ? f.getAbsolutePath()
-                : new File(System.getProperty("user.dir"), dir).getAbsolutePath();
+        // 统一成正归化后的绝对路径：Windows 下分隔符一律用反斜杠，并补齐盘符。
+        Path path = Path.of(dir);
+        if (!path.isAbsolute()) {
+            path = Path.of(System.getProperty("user.dir")).resolve(path);
+        }
+        return path.toAbsolutePath().normalize().toString();
+    }
+
+    /**
+     * 系统"浏览"对话框的默认目录：用户主目录下的下载文件夹（不存在时回退用户主目录）。
+     */
+    static File defaultBrowseDir() {
+        File downloads = new File(System.getProperty("user.home"), "Downloads");
+        if (downloads.isDirectory()) {
+            return downloads;
+        }
+        return new File(System.getProperty("user.home"));
     }
 
     /**
@@ -925,7 +950,8 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             JFileChooser chooser = new JFileChooser();
             chooser.setDialogTitle("选择保存路径");
             chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-            chooser.setCurrentDirectory(new File(pathLabel.getText()));
+            File current = new File(pathLabel.getText().trim());
+            chooser.setCurrentDirectory(current.isDirectory() ? current : defaultBrowseDir());
             int result = chooser.showOpenDialog(this);
             if (result == JFileChooser.APPROVE_OPTION) {
                 updateDefaultSaveDir(chooser.getSelectedFile().getAbsolutePath());
@@ -1160,6 +1186,16 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             return;
         }
 
+        // 网盘分享链接：显示平台名称，并在添加时打开解析窗口
+        CloudProvider cloudProvider = CloudRegistry.detect(url);
+        if (cloudProvider != null) {
+            urlField.putClientProperty("JComponent.outline", null);
+            protocolBadge.set(cloudProvider.drive().displayName, BADGE_CLOUD);
+            detectedProtocol = Protocol.CLOUD;
+            setCredsVisible(false, false);
+            return;
+        }
+
         Protocol p = ProtocolDetector.detect(url);
         detectedProtocol = p;
         if (p == Protocol.UNKNOWN) {
@@ -1180,6 +1216,7 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
             case FTP        -> BADGE_FTP;
             case SFTP       -> BADGE_SFTP;
             case M3U8_HLS   -> BADGE_M3U8;
+            case CLOUD      -> BADGE_CLOUD;
             case MAGNET, TORRENT -> BADGE_TORRENT;
             default         -> BADGE_UNKNOWN;
         };
@@ -1242,6 +1279,13 @@ public class MainWindow extends JFrame implements DownloadManager.TaskListener {
         }
         if (path.isEmpty()) {
             Toast.warning(this, "请选择保存路径");
+            return;
+        }
+
+        // 网盘分享链接需要先选文件：打开解析窗口，由用户勾选后再入队
+        if (CloudRegistry.detect(url) != null) {
+            new CloudParseDialog(this, downloadManager, url).setVisible(true);
+            urlField.setText("");
             return;
         }
 
